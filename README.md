@@ -69,7 +69,7 @@
 ### 安装
 
 ```bash
-go get github.com/yourname/filerotate
+go get github.com/piyongcai-liucai/filerotate
 ```
 
 ### 标准版示例（默认文件锁 + 本地通知器）
