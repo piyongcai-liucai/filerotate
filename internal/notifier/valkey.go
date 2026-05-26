@@ -1,11 +1,12 @@
-// Package filerotate 提供多进程安全的文件轮转功能。
+// Package notifier 提供进程间通知的内部实现。
 //
-// 本文件实现基于 Valkey (Redis) Pub/Sub 的通知器，用于多进程间的广播通信。
-package filerotate
+// 本文件实现基于 Valkey (Redis) Pub/Sub 的通知器。
+package notifier
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 
 	"github.com/valkey-io/valkey-go"
@@ -14,7 +15,7 @@ import (
 // ValkeyNotifier 基于 Valkey (Redis) Pub/Sub 的通知器。
 //
 // 所有订阅同一频道的客户端都会收到命令，消息无持久化。
-// 适合已有 Valkey/Redis 基础设施的场景。
+// 适合已有 Valkey 基础设施的场景。
 //
 // Valkey 的 Pub/Sub 是广播模式（fan-out），每个订阅者都会收到消息副本。
 // 消息不持久化，如果订阅者离线，消息会丢失。
@@ -55,14 +56,14 @@ type ValkeyNotifier struct {
 // 示例：
 //
 //	client, _ := valkey.NewClient(valkey.ClientOption{InitAddress: []string{"localhost:6379"}})
-//	notifier := filerotate.NewValkeyNotifier(client, "filerotate.rotate", nil)
+//	notifier := notifier.NewValkeyNotifier(client, "filerotate.rotate", nil)
 func NewValkeyNotifier(client valkey.Client, channel string, errorHandler func(error)) *ValkeyNotifier {
 	// 创建可取消的上下文，用于控制订阅生命周期
 	ctx, cancel := context.WithCancel(context.Background())
 
 	if errorHandler == nil {
 		errorHandler = func(err error) {
-			fmt.Printf("[Valkey] 错误: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[Valkey] 错误: %v\n", err)
 		}
 	}
 
@@ -135,7 +136,7 @@ func (v *ValkeyNotifier) Connect() (<-chan string, error) {
 // 消息无持久化，如果订阅者离线，消息会丢失。
 //
 // 参数：
-//   - cmd: 要发送的命令（通常为 CmdRotate）
+//   - cmd: 要发送的命令（通常为 "ROTATE"）
 //
 // 返回：
 //   - error: 发布失败的错误

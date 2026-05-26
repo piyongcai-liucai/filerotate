@@ -1,79 +1,68 @@
 // Package filerotate 提供多进程安全的文件轮转功能。
 //
-// 本文件定义进程间轮转通知的通信接口（Notifier）。
-// 所有通知器（本地 IPC、NATS、JetStream、Valkey）均需实现此接口。
-//
-// Notifier 接口抽象了 Leader 与客户端之间的通信机制：
-//   - Leader 通过 Serve() 启动服务端，等待客户端连接
-//   - 客户端通过 Connect() 连接到 Leader，获取命令接收通道
-//   - Leader 通过 Broadcast() 向所有客户端发送轮转命令
-//   - 所有进程通过 Close() 释放资源
-//
-// 内置实现：
-//   - NewLocalNotifier: 本地 IPC（Unix Socket / Windows 命名管道）
-//   - NewNATSNotifier: NATS 核心 Pub/Sub
-//   - NewJetStreamNotifier: NATS JetStream 临时消费者
-//   - NewValkeyNotifier: Valkey Pub/Sub
+// 本文件定义 Notifier 接口及工厂函数，用于进程间轮转通知。
+// 所有通知器实现（本地 IPC、NATS、JetStream、Valkey）均通过此接口对外暴露，
+// 具体实现位于 internal/notifier 包中，外部不可见。
 package filerotate
 
+import (
+	"github.com/nats-io/nats.go"
+	"github.com/valkey-io/valkey-go"
+
+	"github.com/piyongcai-liucai/filerotate/internal/notifier"
+)
+
 // Notifier 定义进程间轮转通知的通信接口。
-//
 // Leader 通过此接口向所有客户端广播轮转命令（CmdRotate）。
 // 所有进程（包括 Leader 自己）都需要通过 Connect() 订阅命令，
 // 以便在收到 ROTATE 命令时执行文件重开操作。
-//
-// 接口设计遵循以下原则：
-//   - 所有方法都是线程安全的
-//   - Serve() 和 Connect() 可以在不同 goroutine 中并发调用
-//   - Broadcast() 应确保所有当前在线的客户端都能收到命令
-//   - Close() 应释放所有资源，关闭所有连接
 type Notifier interface {
 	// Serve 在 Leader 端启动服务，等待客户端连接。
-	//
-	// 对于需要启动服务端的实现（如本地 IPC），此方法会阻塞直到 Close() 被调用。
-	// 对于无需服务端初始化的实现（如 NATS、Valkey），可直接返回 nil。
-	//
-	// 返回：
-	//   - error: 服务启动失败的错误
+	// 对于无需服务端初始化的实现（如 NATS），可直接返回 nil。
 	Serve() error
 
 	// Connect 客户端连接到 Leader，返回一个接收命令的字符串通道。
-	//
-	// 此方法由所有进程（包括 Leader 自己）调用。
 	// 通道中会收到 CmdRotate 等命令，当连接断开时通道关闭。
-	//
-	// 返回：
-	//   - <-chan string: 命令接收通道，通道缓冲至少为 1
-	//   - error: 连接失败的错误
 	Connect() (<-chan string, error)
 
 	// Broadcast 向所有已连接的客户端发送命令。
-	//
-	// 此方法由 Leader 在完成文件轮转后调用。
-	// 应确保所有当前在线的客户端都能收到该命令，包括 Leader 自己。
-	//
-	// 参数：
-	//   - cmd: 要发送的命令（通常为 CmdRotate）
-	//
-	// 返回：
-	//   - error: 发送失败的错误
+	// 应确保所有当前在线的客户端都能收到该命令。
 	Broadcast(cmd string) error
 
 	// Close 关闭通知器，释放资源。
-	//
-	// 此方法在 Writer.Close() 中调用。
-	// 应停止接受新连接，关闭所有现有连接，释放所有资源。
-	//
-	// 返回：
-	//   - error: 关闭失败的错误
 	Close() error
 }
 
 const (
 	// CmdRotate 是 Leader 通知客户端执行文件重开的命令。
-	//
-	// 当 Leader 完成文件轮转（重命名旧文件、创建新文件）后，
-	// 会通过 Broadcast 发送此命令给所有客户端。
-	// 客户端收到此命令后，应关闭旧文件句柄，重新打开新文件。
 	CmdRotate = "ROTATE"
 )
+
+// NewLocalNotifier 创建一个本地 IPC 通知器。
+// commPath 为通信路径：Unix 上为 Socket 文件路径，Windows 上为命名管道名称（不含 \\.\pipe\ 前缀）。
+// errorHandler 为错误处理回调，若为 nil 则默认打印到 stderr。
+func NewLocalNotifier(commPath string, errorHandler func(error)) Notifier {
+	return notifier.NewLocalNotifier(commPath, errorHandler)
+}
+
+// NewNATSNotifier 创建一个基于 NATS 核心 Pub/Sub 的通知器。
+// conn 为已建立的 NATS 连接，subject 为通信主题，所有进程必须使用相同的主题。
+// errorHandler 为错误处理回调，若为 nil 则默认打印到 stderr。
+func NewNATSNotifier(conn *nats.Conn, subject string, errorHandler func(error)) Notifier {
+	return notifier.NewNATSNotifier(conn, subject, errorHandler)
+}
+
+// NewJetStreamNotifier 创建一个基于 NATS JetStream 的通知器。
+// 使用临时消费者（Ephemeral Consumer），进程退出后自动清理，只接收新消息。
+// streamName 为预先创建的 Stream 名称，Serve 会验证其存在。
+// errorHandler 为错误处理回调，若为 nil 则默认打印到 stderr。
+func NewJetStreamNotifier(js nats.JetStreamContext, subject string, streamName string, errorHandler func(error)) Notifier {
+	return notifier.NewJetStreamNotifier(js, subject, streamName, errorHandler)
+}
+
+// NewValkeyNotifier 创建一个基于 Valkey Pub/Sub 的通知器。
+// client 为已连接的 Valkey 客户端，channel 为频道名称，所有进程必须使用相同的频道。
+// errorHandler 为错误处理回调，若为 nil 则默认打印到 stderr。
+func NewValkeyNotifier(client valkey.Client, channel string, errorHandler func(error)) Notifier {
+	return notifier.NewValkeyNotifier(client, channel, errorHandler)
+}

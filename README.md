@@ -69,7 +69,7 @@
 ### 安装
 
 ```bash
-go get github.com/piyongcai-liucai/filerotate
+go get github.com/yourname/filerotate
 ```
 
 ### 标准版示例（默认文件锁 + 本地通知器）
@@ -117,36 +117,41 @@ writer, _ := filerotate.New(filerotate.Config{
 
 ```
 filerotate/
-├── README.md
-├── LICENSE
 ├── go.mod
+├── LICENSE
+├── rotate.go
+├── locker.go
+├── notifier.go
 ├── writer.go
 ├── leader.go
-├── notifier.go
-├── notifier_local_unix.go
-├── notifier_local_windows.go
-├── notifier_nats.go
-├── notifier_jetstream.go
-├── notifier_valkey.go
-├── locker.go
-├── locker_file.go
-├── locker_valkey.go
-├── rotate.go
 ├── lite_writer.go
+├── internal/
+│   ├── locker/
+│   │   ├── file.go
+│   │   └── valkey.go
+│   └── notifier/
+│       ├── local_unix.go
+│       ├── local_windows.go
+│       ├── nats.go
+│       ├── jetstream.go
+│       └── valkey.go
+├── example/
+│   ├── basic/main.go
+│   ├── lite/main.go
+│   ├── nats/main.go
+│   ├── jetstream/main.go
+│   └── valkey/main.go
 ├── writer_test.go
 ├── lite_writer_test.go
 ├── notifier_test.go
-├── notifier_local_test.go
-├── notifier_nats_test.go
-├── notifier_jetstream_test.go
-├── notifier_valkey_test.go
-├── locker_test.go
-└── example/
-    ├── main.go
-    ├── lite_main.go
-    ├── nats_main.go
-    ├── jetstream_main.go
-    └── valkey_main.go
+└── internal/
+    ├── locker/
+    │   └── locker_test.go
+    └── notifier/
+        ├── local_test.go
+        ├── nats_test.go
+        ├── jetstream_test.go
+        └── valkey_test.go
 ```
 
 ## 🔧 配置说明

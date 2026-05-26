@@ -1,0 +1,7 @@
+*.exe
+.claude
+
+*.log*
+filerotate_*
+
+example/log/*

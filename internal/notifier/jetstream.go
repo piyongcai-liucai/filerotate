@@ -1,11 +1,14 @@
-// Package filerotate 提供多进程安全的文件轮转功能。
+// Package notifier 提供进程间通知的内部实现。
 //
-// 本文件实现基于 NATS JetStream 的通知器，使用临时消费者实现广播。
-package filerotate
+// 本文件实现基于 NATS JetStream 的临时消费者通知器。
+// Stream 必须由外部预先创建，通知器只验证其存在。
+package notifier
 
 import (
 	"fmt"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -33,7 +36,7 @@ type JetStreamNotifier struct {
 	// msgCh 内部命令接收通道，Connect() 返回此通道给调用者
 	msgCh chan string
 
-	// wg 等待监控协程退出
+	// wg 用于等待消息处理协程结束
 	wg sync.WaitGroup
 
 	// errorHandler 错误处理回调，如果为 nil，错误将打印到 stderr
@@ -51,11 +54,11 @@ type JetStreamNotifier struct {
 // 示例：
 //
 //	js, _ := nc.JetStream()
-//	notifier := filerotate.NewJetStreamNotifier(js, "filerotate.rotate", "FILEROTATE", nil)
+//	notifier := notifier.NewJetStreamNotifier(js, "filerotate.rotate", "FILEROTATE", nil)
 func NewJetStreamNotifier(js nats.JetStreamContext, subject string, streamName string, errorHandler func(error)) *JetStreamNotifier {
 	if errorHandler == nil {
 		errorHandler = func(err error) {
-			fmt.Printf("[JetStream] 错误: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[JetStream] 错误: %v\n", err)
 		}
 	}
 	return &JetStreamNotifier{
@@ -109,6 +112,17 @@ func (j *JetStreamNotifier) Connect() (<-chan string, error) {
 		return nil, err
 	}
 	j.sub = sub
+
+	// 启动一个 goroutine 等待订阅结束，并在退出时关闭通道
+	j.wg.Add(1)
+	go func() {
+		defer j.wg.Done()
+		defer close(j.msgCh)
+		for j.sub.IsValid() {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
 	return j.msgCh, nil
 }
 
@@ -118,7 +132,7 @@ func (j *JetStreamNotifier) Connect() (<-chan string, error) {
 // 消息会持久化到 Stream 中，确保即使消费者暂时离线也能收到。
 //
 // 参数：
-//   - cmd: 要发送的命令（通常为 CmdRotate）
+//   - cmd: 要发送的命令（通常为 "ROTATE"）
 //
 // 返回：
 //   - error: 发布失败的错误
@@ -132,14 +146,16 @@ func (j *JetStreamNotifier) Broadcast(cmd string) error {
 
 // Close 取消订阅，释放资源。
 //
-// 临时消费者会在进程退出后自动清理。
+// 取消订阅后，会等待消息处理协程完全退出并关闭通道。
 //
 // 返回：
 //   - error: 取消订阅失败的错误
 func (j *JetStreamNotifier) Close() error {
 	if j.sub != nil {
-		return j.sub.Unsubscribe()
+		j.sub.Unsubscribe()
 	}
+	// 等待后台 goroutine 退出，它会负责关闭 msgCh
+	j.wg.Wait()
 	return nil
 }
 

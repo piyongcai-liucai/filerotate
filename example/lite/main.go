@@ -1,30 +1,108 @@
-// Lite 版示例：极简设计，无进程间通信，仅依赖文件锁和本地计数。
+// Lite 版示例：模拟 3 个进程并发写入，无 IPC，仅通过分布式锁协调轮转。
+//
+// 运行多个实例可验证真正的跨进程协调：
+//
+//	go run .          # 终端 1
+//	go run .          # 终端 2
+//	go run .          # 终端 3
+//
+// 每个进程独立追踪本地写入量，达到 PerProcSizeMB 阈值后尝试获取分布式锁执行轮转。
+// 总共轮转 10 次后自动退出。
 package main
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/piyongcai-liucai/filerotate"
 )
 
+const (
+	numProcs  = 3
+	logFile   = "../log/app.lite.log"
+	maxSizeMB = 1
+	maxRotate = 10
+)
+
 func main() {
-	// 创建 Lite 版 Writer
+	fmt.Printf("=== Lite 版多进程示例 ===\n")
+	fmt.Printf("进程数: %d | 每进程轮转阈值: %d MB | 目标轮转次数: %d\n", numProcs, maxSizeMB, maxRotate)
+
+	os.MkdirAll(filepath.Dir(logFile), 0o755)
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		monitorRotations(logFile, maxRotate, done)
+	}()
+
+	for id := 0; id < numProcs; id++ {
+		wg.Add(1)
+		go func(procID int) {
+			defer wg.Done()
+			runLiteProcess(procID, done)
+		}(id)
+	}
+
+	wg.Wait()
+	fmt.Println("所有进程已退出")
+}
+
+func runLiteProcess(id int, done <-chan struct{}) {
 	writer, err := filerotate.NewLiteWriter(filerotate.LiteConfig{
-		FilePath:         "../log/app.log", // 日志文件路径
-		PerProcSizeMB:    1,                // 每个进程写入 25 MB 后触发轮转
-		MaxAgeDays:       7,                // 备份保留 7 天
-		MaxWriteInterval: time.Second,
+		FilePath:      logFile,
+		PerProcSizeMB: maxSizeMB,
+		MaxAgeDays:    7,
 	})
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "[进程 %d] 创建 LiteWriter 失败: %v\n", id, err)
+		return
 	}
 	defer writer.Close()
 
+	pid := os.Getpid()
 	for i := 0; ; i++ {
-		fmt.Fprintf(writer, "[PID %d] %s log entry %d\n",
-			os.Getpid(), time.Now().Format(time.RFC3339), i)
+		select {
+		case <-done:
+			fmt.Printf("[进程 %d] 收到退出信号，已写入 %d 条日志\n", id, i)
+			return
+		default:
+		}
+
+		fmt.Fprintf(writer, "[进程 %d/%d PID %d] %s 第 %d 条日志 —— Lite版文件锁协调示例\n",
+			id, numProcs, pid, time.Now().Format(time.RFC3339), i)
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func monitorRotations(filePath string, max int, done chan<- struct{}) {
+	base := filepath.Base(filePath)
+	for {
+		count := countBackups(filePath, base)
+		fmt.Printf("\r[监控] 当前备份数: %d/%d", count, max)
+		if count >= max {
+			fmt.Printf("\n[监控] 已达到 %d 次轮转，通知进程退出\n", max)
+			close(done)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func countBackups(filePath, base string) int {
+	matches, _ := filepath.Glob(filePath + ".2*")
+	n := 0
+	for _, m := range matches {
+		ext := strings.TrimPrefix(filepath.Base(m), base+".")
+		if len(ext) == 25 && ext[8] == '_' && ext[15] == '.' {
+			n++
+		}
+	}
+	return n
 }
