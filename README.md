@@ -1,78 +1,51 @@
 # filerotate
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/yourname/filerotate.svg)](https://pkg.go.dev/github.com/yourname/filerotate)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yourname/filerotate)](https://goreportcard.com/report/github.com/yourname/filerotate)
+[![Go Reference](https://pkg.go.dev/badge/github.com/piyongcai-liucai/filerotate.svg)](https://pkg.go.dev/github.com/piyongcai-liucai/filerotate)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **多进程安全的文件轮转库**，提供两种实现以应对不同场景：
 
-- **标准版** (`Writer`) – 自动发现所有写入进程，通过 Leader 选举与可插拔的跨平台通知机制实现精确协调。
-- **Lite 版** (`LiteWriter`) – 极简设计，仅依赖本地写入计数和分布式锁选举，无进程间通信，通过时间间隔检查自动感知外部轮转。
+- **标准版** (`Writer`) – 自动发现所有写入进程，通过 Leader 选举与可插拔的进程间通知机制实现精确协调。
+- **Lite 版** (`LiteWriter`) – 极简设计，仅依赖本地写入计数和分布式锁选举，无进程间通信。
 
-## ✨ 特性
+## 特性
 
 ### 两种版本共有
 
-- **多进程安全** – 轮转时通过**分布式锁**（文件锁、Valkey）保证唯一执行者。
-- **按大小轮转** – 文件达到设定大小后自动重命名为带时间戳的备份文件并创建新文件，备份文件名精确到秒。
+- **多进程安全** – 轮转时通过分布式锁（文件锁、Valkey Redlock）保证唯一执行者。
+- **按大小轮转** – 文件达到设定大小后自动重命名为带纳秒级时间戳的备份文件。
 - **自动清理** – 可配置备份文件保留天数，过期自动删除。
-- **零日志丢失** – 轮转期间其他进程的写入会完整保留在备份文件中。
-- **高性能写入** – 常态写入零额外系统调用，锁竞争仅在轮转瞬间发生。
+- **零日志丢失** – 轮转期间其他进程的写入会完整保留在备份文件中，下次写入自动重开文件。
+- **Windows 支持** – 使用 `FILE_SHARE_DELETE` 打开文件，允许其他进程在持有句柄时执行重命名。
 
 ### 标准版额外优势
 
 - **全自动进程发现** – 无需手动配置进程数，Leader 锁自动协调所有进程。
-- **写入速率差异无关** – 慢进程通过通知保持同步。
 - **Leader 死亡自动恢复** – 原 Leader 崩溃后其他进程自动重新选举。
 - **可插拔通知与锁** – 提供 `Notifier` 和 `Locker` 接口，内置多种实现。
 
 ### Lite 版特点
 
 - **无进程间通信** – 极低开销，仅依赖分布式锁和内存计数。
-- **时间间隔检查** – 如果距离上次写入时间过长，自动检查文件是否已被轮转，避免慢进程长期持有旧文件句柄。
-- **进程数需要预估** – 轮转阈值基于单个进程写入量，但时间检查可弥补慢进程的滞后。
+- **进程数需要预估** – 轮转阈值基于单个进程写入量（如 4 进程、目标 100MB 则设为 25MB/进程）。
+- **时间间隔检查** – 超过 `MaxWriteInterval` 未写入时自动检查文件是否被轮转。
 
-## 🔧 平台支持
+## 平台支持
 
 | 版本 | Linux | macOS | Windows | 说明 |
 |------|-------|-------|---------|------|
-| **标准版** (`Writer`) | ✅ | ✅ | ✅ | 默认使用 `NewLocalNotifier`，内部自动选择 Unix Socket 或 Windows 命名管道 |
-| **Lite 版** (`LiteWriter`) | ✅ | ✅ | ✅ | 仅依赖跨平台文件锁 (`gofrs/flock`)，无平台特定代码 |
+| **标准版** (`Writer`) | ✅ | ✅ | ✅ | 默认 Unix Socket / Windows 命名管道 |
+| **Lite 版** (`LiteWriter`) | ✅ | ✅ | ✅ | 仅依赖跨平台文件锁，无平台特定代码 |
 
-## 📦 内置组件
-
-### 通知器（Notifier）
-
-| 实现 | 构造函数 | 广播 | 持久化 | 说明 |
-|------|----------|------|--------|------|
-| 本地 IPC | `NewLocalNotifier(commPath)` | ✅ | ❌ | 默认，Unix Socket / 命名管道 |
-| NATS 核心 | `NewNATSNotifier(conn, subject)` | ✅ | ❌ | 需要 NATS 服务 |
-| JetStream | `NewJetStreamNotifier(js, subject)` | ✅ | ✅ | 临时消费者，Stream 外部创建 |
-| Valkey | `NewValkeyNotifier(client, channel)` | ✅ | ❌ | 需要 Valkey/Redis |
-
-### 分布式锁（Locker）—— 可选扩展
-
-文件轮转本身是**本地文件系统操作**，在单机多进程部署时，**默认的文件锁（`NewFileLocker`）已经足够**，你无需关心 `Locker` 接口。`Locker` 抽象是为以下特殊场景设计的：
-
-- **NFS 共享存储**：当多个主机挂载同一个 NFS 目录，且部署在不同主机上的应用实例都向该目录下的同一个日志文件写入时，文件锁可能不可靠（部分 NFS 实现不支持 `flock`）。此时可以使用 **Valkey 锁** 来跨主机协调轮转。
-- **单元测试**：可以注入自定义实现来模拟锁行为，无需真实文件系统。
-
-| 实现 | 构造函数 | 特色 | 适用场景 |
-|------|----------|------|----------|
-| 文件锁 | `NewFileLocker(lockPath)` | 本地互斥，默认 | 单机多进程 |
-| Valkey 锁 | `NewValkeyLocker(clientOption, key, keyMajority, keyValidity)` | Redlock 算法，自动续期，多节点多数派 | 跨主机（如 NFS）、已有 Valkey |
-
-> **重要**：如果你只在**单台机器**上运行多个进程（例如 GoFiber 的 `prefork` 模式、容器副本共享本地卷），那么你完全不需要分布式锁，默认的文件锁就是最简单、最快速的方案。`Locker` 接口仅作为可选扩展提供，不会增加你的使用负担。
-
-## 🚀 快速开始
+## 快速开始
 
 ### 安装
 
 ```bash
-go get github.com/yourname/filerotate
+go get github.com/piyongcai-liucai/filerotate
 ```
 
-### 标准版示例（默认文件锁 + 本地通知器）
+### 标准版（Leader 选举 + 本地 IPC）
 
 ```go
 writer, err := filerotate.New(filerotate.Config{
@@ -80,92 +53,75 @@ writer, err := filerotate.New(filerotate.Config{
     MaxSizeMB:     10,
     MaxAgeDays:    7,
     CheckInterval: 5 * time.Second,
+    ErrorHandler:  func(err error) { log.Printf("filerotate: %v", err) },
 })
+if err != nil {
+    log.Fatal(err)
+}
+defer writer.Close()
+
+// 直接用作 log.Logger 的输出
+log.SetOutput(writer)
 ```
 
-### Lite 版示例（默认文件锁，默认最大写入间隔 5 秒）
+### Lite 版（无 IPC，分布式锁协调）
 
 ```go
 writer, err := filerotate.NewLiteWriter(filerotate.LiteConfig{
-    FilePath:        "./app.log",
-    PerProcSizeMB:   25,
-    MaxAgeDays:      7,
+    FilePath:         "./app.log",
+    PerProcSizeMB:    25, // 4 进程 × 25MB ≈ 100MB 触发轮转
+    MaxAgeDays:       7,
+    MaxWriteInterval: 5 * time.Second,
 })
+if err != nil {
+    log.Fatal(err)
+}
+defer writer.Close()
+
+log.SetOutput(writer)
 ```
 
-### 使用 Valkey 锁和通知器（跨主机 NFS）
+### 使用 Valkey 通知器和锁（跨主机 NFS）
 
 ```go
-valkeyLocker, _ := filerotate.NewValkeyLocker(
-    valkey.ClientOption{InitAddress: []string{"localhost:6379"}},
-    "filerotate-lock", 1, 30*time.Second,
+client, _ := valkey.NewClient(valkey.ClientOption{
+    InitAddress: []string{"localhost:6379"},
+})
+
+locker, _ := filerotate.NewValkeyLocker(
+    valkeylock.LockerOption{
+        ClientOption: valkey.ClientOption{InitAddress: []string{"localhost:6379"}},
+        KeyMajority:  1,
+        KeyValidity:  30 * time.Second,
+    },
+    "filerotate-lock",
 )
 
 writer, _ := filerotate.New(filerotate.Config{
-    FilePath: "/nfs/logs/app.log",
+    FilePath:  "/nfs/logs/app.log",
     MaxSizeMB: 10,
     LockerFactory: func(lockPath string) (filerotate.Locker, error) {
-        return valkeyLocker, nil
+        return locker, nil
     },
-    NotifierFactory: func(commPath string) (filerotate.Notifier, error) {
-        return filerotate.NewValkeyNotifier(client, "filerotate.rotate"), nil
+    NotifierFactory: func(commPath string, errorHandler func(error)) (filerotate.Notifier, error) {
+        return filerotate.NewValkeyNotifier(client, "filerotate:rotate", errorHandler), nil
     },
 })
 ```
 
-## 📂 项目结构
-
-```
-filerotate/
-├── go.mod
-├── LICENSE
-├── rotate.go
-├── locker.go
-├── notifier.go
-├── writer.go
-├── leader.go
-├── lite_writer.go
-├── internal/
-│   ├── locker/
-│   │   ├── file.go
-│   │   └── valkey.go
-│   └── notifier/
-│       ├── local_unix.go
-│       ├── local_windows.go
-│       ├── nats.go
-│       ├── jetstream.go
-│       └── valkey.go
-├── example/
-│   ├── basic/main.go
-│   ├── lite/main.go
-│   ├── nats/main.go
-│   ├── jetstream/main.go
-│   └── valkey/main.go
-├── writer_test.go
-├── lite_writer_test.go
-├── notifier_test.go
-└── internal/
-    ├── locker/
-    │   └── locker_test.go
-    └── notifier/
-        ├── local_test.go
-        ├── nats_test.go
-        ├── jetstream_test.go
-        └── valkey_test.go
-```
-
-## 🔧 配置说明
+## 配置说明
 
 ### 标准版 Config
 
 ```go
 type Config struct {
-    FilePath        string
-    MaxSizeMB       int
-    MaxAgeDays      int
-    CheckInterval   time.Duration                              // 默认 5 秒
-    LockerFactory   func(lockPath string) (Locker, error)      // 默认文件锁
-    NotifierFactory func(commPath string) (Notifier, error)    // 默认本地 IPC
+    FilePath        string                                          // 文件路径，所有进程必须相同
+    MaxSizeMB       int                                             // 触发轮转的文件大小（MB）
+    MaxAgeDays      int                                             // 备份保留天数，0 为永久
+    CheckInterval   time.Duration                                   // Leader 检查文件大小的间隔，默认 5s
+    LockerFactory   func(lockPath string) (Locker, error)           // 自定义锁工厂，默认文件锁
+    NotifierFactory func(commPath string, errorHandler func(error)) (Notifier, error) // 自定义通知器工厂，默认本地 IPC
+    ErrorHandler    func(error)                                     // 内部 goroutine 错误回调，默认打印 stderr
 }
 ```
 
@@ -173,19 +129,85 @@ type Config struct {
 
 ```go
 type LiteConfig struct {
-    FilePath         string
-    PerProcSizeMB    int
-    MaxAgeDays       int
-    MaxWriteInterval time.Duration                              // 最大写入间隔，默认 5 秒
-    LockerFactory    func(lockPath string) (Locker, error)      // 默认文件锁
+    FilePath         string                                // 文件路径，所有进程必须相同
+    PerProcSizeMB    int                                   // 每个进程写入多少 MB 后触发轮转检查
+    MaxAgeDays       int                                   // 备份保留天数，0 为永久
+    MaxWriteInterval time.Duration                         // 最大写入间隔，超时检查文件是否被轮转，默认 5s
+    LockerFactory    func(lockPath string) (Locker, error) // 自定义锁工厂，默认文件锁
 }
 ```
 
-## ❓ 选型指南
+## 内置组件
 
-| 场景 | 通知器 | 锁 |
-|------|--------|-----|
-| 单机多进程（默认） | `NewLocalNotifier` | `NewFileLocker` |
-| 跨主机 NFS 共享 | `NewNATSNotifier` 或 `NewValkeyNotifier` | `NewValkeyLocker` |
-| 已有 NATS 基础设施 | `NewNATSNotifier` | 任意锁（推荐文件锁） |
-| 需要持久化通知 | `NewJetStreamNotifier` | 任意锁 |
+### 通知器（Notifier）
+
+| 实现 | 构造函数 | 说明 |
+|------|----------|------|
+| 本地 IPC | `NewLocalNotifier(commPath, errorHandler)` | 默认，Unix Socket / Windows 命名管道 |
+| NATS 核心 | `NewNATSNotifier(conn, subject, errorHandler)` | Pub/Sub，需要 NATS 服务 |
+| JetStream | `NewJetStreamNotifier(js, subject, streamName, errorHandler)` | 临时消费者，Stream 外部创建 |
+| Valkey | `NewValkeyNotifier(client, channel, errorHandler)` | Pub/Sub，需要 Valkey/Redis |
+
+### 分布式锁（Locker）
+
+| 实现 | 构造函数 | 说明 |
+|------|----------|------|
+| 文件锁 | `NewFileLocker(lockPath)` | 默认，基于 `gofrs/flock`，单机多进程 |
+| Valkey 锁 | `NewValkeyLocker(option, key)` | Redlock 算法，自动续期，适合跨主机 |
+
+> 如果你只在单台机器上运行多个进程，默认的文件锁就是最简单、最快速的方案。`Locker` 接口仅作为可选扩展提供。
+
+## 选型指南
+
+| 场景 | Writer 类型 | 通知器 | 锁 |
+|------|-------------|--------|-----|
+| 单机多进程 | 标准版 | `NewLocalNotifier` | `NewFileLocker` |
+| 单机，极简 | Lite 版 | 不需要 | `NewFileLocker` |
+| 跨主机 NFS | 标准版 | `NewValkeyNotifier` 或 `NewNATSNotifier` | `NewValkeyLocker` |
+| 已有 NATS | 标准版 | `NewNATSNotifier` | `NewFileLocker` |
+| 需要持久化通知 | 标准版 | `NewJetStreamNotifier` | 任意 |
+
+## 项目结构
+
+```
+filerotate/
+├── writer.go              # 标准版 Writer + Config
+├── writer_lite.go         # Lite 版 LiteWriter + LiteConfig
+├── leader.go              # Leader 选举与文件大小监控
+├── rotate.go              # 文件重命名、备份清理、时间戳解析
+├── open_file_unix.go      # Unix: O_CREATE|O_APPEND|O_WRONLY
+├── open_file_windows.go   # Windows: CreateFile + FILE_SHARE_DELETE
+├── locker.go              # Locker 接口 + 工厂函数
+├── notifier.go            # Notifier 接口 + 工厂函数
+├── integration_test.go    # 多进程集成测试
+├── internal/
+│   ├── locker/
+│   │   ├── file.go        # 文件锁（flock）
+│   │   └── valkey.go      # Valkey 锁（Redlock）
+│   └── notifier/
+│       ├── local_unix.go  # Unix Socket
+│       ├── local_windows.go # Windows 命名管道
+│       ├── nats.go        # NATS Pub/Sub
+│       ├── jetstream.go   # JetStream 临时消费者
+│       └── valkey.go      # Valkey Pub/Sub
+└── example/
+    ├── basic/             # 标准版多进程示例（本地 IPC）
+    ├── lite/              # Lite 版多进程示例
+    ├── nats/              # NATS 通知器示例
+    ├── jetstream/         # JetStream 通知器示例
+    └── valkey/            # Valkey 通知器 + 锁示例
+```
+
+## 轮转文件命名
+
+备份文件使用纳秒级精度时间戳，避免高频轮转时文件名冲突：
+
+```
+app.log.20240501_143025.123456789
+```
+
+旧格式（秒级精度）的备份文件同样支持识别和清理：
+
+```
+app.log.20240501_143025
+```
