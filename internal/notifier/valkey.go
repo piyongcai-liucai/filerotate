@@ -101,6 +101,16 @@ func (v *ValkeyNotifier) Serve() error {
 //   - <-chan string: 命令接收通道，当订阅关闭时通道会被关闭
 //   - error: 订阅失败的错误
 func (v *ValkeyNotifier) Connect() (<-chan string, error) {
+	// 取消旧订阅并等待退出，避免重复连接时 close 已关闭的 channel
+	if v.cancel != nil {
+		v.cancel()
+		v.wg.Wait()
+	}
+
+	// 为本次连接创建新的 channel 和 context
+	v.msgCh = make(chan string, 8)
+	v.ctx, v.cancel = context.WithCancel(context.Background())
+
 	// 构建 SUBSCRIBE 命令
 	subscribeCmd := v.client.B().Subscribe().Channel(v.channel).Build()
 

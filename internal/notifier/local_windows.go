@@ -67,7 +67,9 @@ func (l *LocalNotifier) Serve() error {
 		l.reportError(fmt.Errorf("命名管道 Listen 重试失败: %w", err))
 		return err
 	}
+	l.mu.Lock()
 	l.listener = listener
+	l.mu.Unlock()
 
 	for {
 		conn, err := listener.Accept()

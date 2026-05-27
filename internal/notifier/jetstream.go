@@ -95,15 +95,17 @@ func (j *JetStreamNotifier) Serve() error {
 //   - <-chan string: 命令接收通道，当订阅关闭时通道会被关闭
 //   - error: 订阅失败的错误
 func (j *JetStreamNotifier) Connect() (<-chan string, error) {
-	// 创建临时消费者，只接收新消息
-	// - DeliverNew: 只接收订阅后发布的新消息
-	// - AckExplicit: 显式确认模式
-	// - ManualAck: 手动确认，需要调用 msg.Ack()
+	// 取消旧订阅，避免重复连接时资源泄漏
+	if j.sub != nil {
+		j.sub.Unsubscribe()
+	}
+
 	sub, err := j.js.Subscribe(j.subject, func(msg *nats.Msg) {
-		// 将消息内容发送到内部通道
-		j.msgCh <- string(msg.Data)
-		// 立即确认，防止重复投递
-		msg.Ack()
+		select {
+		case j.msgCh <- string(msg.Data):
+			msg.Ack()
+		default:
+		}
 	}, nats.DeliverNew(),
 		nats.AckExplicit(),
 		nats.ManualAck())
@@ -146,13 +148,13 @@ func (j *JetStreamNotifier) Broadcast(cmd string) error {
 
 // Close 取消订阅，释放资源。
 //
-// 取消订阅后，会等待消息处理协程完全退出并关闭通道。
+// 使用 Drain() 等待所有在途回调完成后再关闭通道，避免向已关闭通道发送导致 panic。
 //
 // 返回：
 //   - error: 取消订阅失败的错误
 func (j *JetStreamNotifier) Close() error {
 	if j.sub != nil {
-		j.sub.Unsubscribe()
+		j.sub.Drain()
 	}
 	// 等待后台 goroutine 退出，它会负责关闭 msgCh
 	j.wg.Wait()

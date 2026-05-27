@@ -28,9 +28,6 @@ type LiteConfig struct {
 	// PollInterval 轮询间隔，默认 1 秒。
 	PollInterval time.Duration
 
-	// LockerFactory 自定义锁工厂函数。若为 nil，使用默认文件锁。
-	LockerFactory func(lockPath string) (Locker, error)
-
 	// ErrorHandler 错误处理回调。若为 nil，默认打印到 stderr。
 	ErrorHandler func(error)
 }
@@ -42,9 +39,6 @@ type LiteConfig struct {
 func NewLite(cfg LiteConfig) (*Writer, error) {
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 1 * time.Second
-	}
-	if cfg.LockerFactory == nil {
-		cfg.LockerFactory = func(p string) (Locker, error) { return NewFileLocker(p) }
 	}
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(err error) {
@@ -77,7 +71,7 @@ func NewLite(cfg LiteConfig) (*Writer, error) {
 	}
 
 	// 创建轮转分布式锁
-	w.rotateLocker, err = cfg.LockerFactory(w.lockPath)
+	w.rotateLocker, err = NewFileLocker(w.lockPath)
 	if err != nil {
 		w.file.Close()
 		return nil, fmt.Errorf("create rotate locker: %w", err)

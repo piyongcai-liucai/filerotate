@@ -73,6 +73,9 @@ func (n *NATSNotifier) Serve() error {
 // 所有订阅该 subject 的客户端都会收到消息（广播模式）。
 // NATS 的 Subscribe 是异步的，回调函数在收到消息时被调用。
 func (n *NATSNotifier) Connect() (<-chan string, error) {
+	if n.sub != nil {
+		n.sub.Unsubscribe()
+	}
 	sub, err := n.conn.Subscribe(n.subject, func(msg *nats.Msg) {
 		select {
 		case n.msgCh <- string(msg.Data):
@@ -97,9 +100,10 @@ func (n *NATSNotifier) Broadcast(cmd string) error {
 }
 
 // Close 取消订阅并关闭通道，释放资源。
+// 使用 Drain() 等待所有在途回调完成，避免向已关闭通道发送导致 panic。
 func (n *NATSNotifier) Close() error {
 	if n.sub != nil {
-		n.sub.Unsubscribe()
+		n.sub.Drain()
 	}
 	close(n.msgCh)
 	return nil

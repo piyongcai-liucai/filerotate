@@ -21,9 +21,12 @@ import (
 // 通过 w.done 通道接收退出信号，Close 时安全退出。
 func (w *Writer) runLeader() {
 	defer w.wg.Done()
+	defer w.leaderLocker.Unlock()
 
 	// 启动通知器服务端（如 Unix Socket 监听、命名管道监听）
+	w.wg.Add(1)
 	go func() {
+		defer w.wg.Done()
 		if err := w.notifier.Serve(); err != nil {
 			w.reportError(fmt.Errorf("Leader Serve 失败: %w", err))
 		}
@@ -49,7 +52,11 @@ func (w *Writer) runLeader() {
 	}
 
 	// 启动命令处理协程，监听来自 Notifier 的命令
-	go w.handleCommands(cmdCh)
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.handleCommands(cmdCh)
+	}()
 
 	// 定期检查文件大小
 	ticker := time.NewTicker(w.checkInterval)
@@ -65,7 +72,7 @@ func (w *Writer) runLeader() {
 				continue
 			}
 
-			if fi.Size() >= w.maxSize {
+			if w.maxSize > 0 && fi.Size() >= w.maxSize {
 				if err := w.doRotation(); err != nil {
 					w.reportError(fmt.Errorf("轮转执行失败: %w", err))
 					continue
