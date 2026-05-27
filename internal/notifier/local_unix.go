@@ -48,20 +48,19 @@ func NewLocalNotifier(commPath string, errorHandler func(error)) *LocalNotifier 
 	}
 }
 
-// Serve 启动 Unix Socket 监听，接受客户端连接。
+// Serve 启动 Unix Socket 接受循环。
 func (l *LocalNotifier) Serve() error {
-	// 删除可能残留的旧 socket 文件，确保 Listen 成功
 	os.Remove(l.socketPath)
-
 	listener, err := net.Listen("unix", l.socketPath)
 	if err != nil {
-		l.reportError(fmt.Errorf("Unix Socket Listen 失败: %w", err))
-		return err
+		return fmt.Errorf("%w: %w", ErrLeaderExists, err)
 	}
+	l.mu.Lock()
 	l.listener = listener
+	l.mu.Unlock()
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := l.listener.Accept()
 		if err != nil {
 			select {
 			case <-l.done:
@@ -75,24 +74,6 @@ func (l *LocalNotifier) Serve() error {
 		l.mu.Lock()
 		l.clients[conn] = struct{}{}
 		l.mu.Unlock()
-
-		go l.handleConn(conn)
-	}
-}
-
-func (l *LocalNotifier) handleConn(conn net.Conn) {
-	defer func() {
-		l.mu.Lock()
-		delete(l.clients, conn)
-		l.mu.Unlock()
-		conn.Close()
-	}()
-
-	buf := make([]byte, 1024)
-	for {
-		if _, err := conn.Read(buf); err != nil {
-			return
-		}
 	}
 }
 
@@ -112,6 +93,9 @@ func (l *LocalNotifier) Connect() (<-chan string, error) {
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			ch <- scanner.Text()
+		}
+		if err := scanner.Err(); err != nil {
+			l.reportError(fmt.Errorf("Unix Socket 读取失败: %w", err))
 		}
 	}()
 

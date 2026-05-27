@@ -14,11 +14,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/piyongcai-liucai/filerotate"
+	"github.com/piyongcai-liucai/filerotate/example/common"
 )
 
 const (
@@ -41,7 +41,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		monitorRotations(logFile, maxRotate, done)
+		common.MonitorRotations(logFile, maxRotate, done)
 	}()
 
 	// 启动 N 个模拟进程
@@ -83,33 +83,4 @@ func runStandardProcess(id int, done <-chan struct{}) {
 			id, numProcs, pid, time.Now().Format(time.RFC3339), i)
 		time.Sleep(time.Millisecond)
 	}
-}
-
-// monitorRotations 定期检查备份文件数量，达到上限后关闭 done channel。
-func monitorRotations(filePath string, max int, done chan<- struct{}) {
-	base := filepath.Base(filePath)
-	for {
-		count := countBackups(filePath, base)
-		fmt.Printf("\r[监控] 当前备份数: %d/%d", count, max)
-		if count >= max {
-			fmt.Printf("\n[监控] 已达到 %d 次轮转，通知进程退出\n", max)
-			close(done)
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// countBackups 统计符合轮转备份命名规范的文件数量。
-func countBackups(filePath, base string) int {
-	matches, _ := filepath.Glob(filePath + ".2*")
-	n := 0
-	for _, m := range matches {
-		ext := strings.TrimPrefix(filepath.Base(m), base+".")
-		// 备份格式: 20060102_150405.000000000 (25字符，纳秒精度)
-		if len(ext) == 25 && ext[8] == '_' && ext[15] == '.' {
-			n++
-		}
-	}
-	return n
 }

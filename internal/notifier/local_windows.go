@@ -60,12 +60,10 @@ func (l *LocalNotifier) Serve() error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		l.reportError(fmt.Errorf("命名管道 Listen 失败: %w", err))
 		return err
 	}
 	if err != nil {
-		l.reportError(fmt.Errorf("命名管道 Listen 重试失败: %w", err))
-		return err
+		return fmt.Errorf("%w: %w", ErrLeaderExists, err)
 	}
 	l.mu.Lock()
 	l.listener = listener
@@ -85,22 +83,6 @@ func (l *LocalNotifier) Serve() error {
 		l.mu.Lock()
 		l.clients[conn] = struct{}{}
 		l.mu.Unlock()
-		go l.handleConn(conn)
-	}
-}
-
-func (l *LocalNotifier) handleConn(conn net.Conn) {
-	defer func() {
-		l.mu.Lock()
-		delete(l.clients, conn)
-		l.mu.Unlock()
-		conn.Close()
-	}()
-	buf := make([]byte, 1024)
-	for {
-		if _, err := conn.Read(buf); err != nil {
-			return
-		}
 	}
 }
 
@@ -116,9 +98,13 @@ func (l *LocalNotifier) Connect() (<-chan string, error) {
 	go func() {
 		defer close(ch)
 		defer conn.Close()
+
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			ch <- scanner.Text()
+		}
+		if err := scanner.Err(); err != nil {
+			l.reportError(fmt.Errorf("命名管道 读取失败: %w", err))
 		}
 	}()
 	return ch, nil
@@ -128,6 +114,7 @@ func (l *LocalNotifier) Connect() (<-chan string, error) {
 func (l *LocalNotifier) Broadcast(cmd string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	for conn := range l.clients {
 		_, err := fmt.Fprintln(conn, cmd)
 		if err != nil {

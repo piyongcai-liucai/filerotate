@@ -37,7 +37,9 @@ func TestValkeyNotifierBroadcast(t *testing.T) {
 	// 等待订阅完成，否则可能丢失消息
 	time.Sleep(100 * time.Millisecond)
 
-	n.Broadcast(cmdRotate)
+	if err := n.Broadcast(cmdRotate); err != nil {
+		t.Fatalf("broadcast: %v", err)
+	}
 	assertChannelReceived(t, ch, cmdRotate, 2*time.Second)
 }
 
@@ -58,7 +60,6 @@ func TestValkeyNotifierMultipleClients(t *testing.T) {
 	ch2, _ := n2.Connect()
 	time.Sleep(100 * time.Millisecond)
 
-	// 通过第一个通知器广播
 	if err := n1.Broadcast(cmdRotate); err != nil {
 		t.Fatalf("broadcast: %v", err)
 	}
@@ -145,4 +146,41 @@ func TestValkeyNotifierNoPersistence(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		// 预期超时
 	}
+}
+
+// ---------- 边界测试 ----------
+
+func TestValkeyNotifier_NilErrorHandler(t *testing.T) {
+	client := connectValkeyOrSkip(t)
+	defer client.Close()
+
+	n := NewValkeyNotifier(client, "filerotate.test.nilhandler", nil)
+	defer n.Close()
+
+	// reportError 在 nil handler 时应安全返回
+	n.reportError(nil)
+}
+
+func TestValkeyNotifier_Serve(t *testing.T) {
+	client := connectValkeyOrSkip(t)
+	defer client.Close()
+
+	n := NewValkeyNotifier(client, "filerotate.test.serve", discardErrors)
+	defer n.Close()
+
+	if err := n.Serve(); err != nil {
+		t.Fatalf("Serve should return nil: %v", err)
+	}
+}
+
+func TestValkeyNotifier_BroadcastError(t *testing.T) {
+	client := connectValkeyOrSkip(t)
+	n := NewValkeyNotifier(client, "filerotate.test.bcasterr", discardErrors)
+
+	client.Close() // 关闭连接使后续操作失败
+	err := n.Broadcast("ROTATE")
+	if err == nil {
+		t.Fatal("expected broadcast error after client close")
+	}
+	n.Close()
 }

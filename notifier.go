@@ -14,6 +14,10 @@ import (
 	"github.com/piyongcai-liucai/filerotate/internal/notifier"
 )
 
+// ErrLeaderExists 表示 Leader 已存在，Serve() 因管道/Socket 被占用而无法启动。
+// 这是正常竞态，调用方应静默降级为客户端而非报错。
+var ErrLeaderExists = notifier.ErrLeaderExists
+
 // Notifier 定义进程间轮转通知的通信接口。
 // Leader 通过此接口向所有客户端广播轮转命令（CmdRotate）。
 // 所有进程（包括 Leader 自己）都需要通过 Connect() 订阅命令，
@@ -61,10 +65,9 @@ func NewNATSNotifier(conn *nats.Conn, subject string, errorHandler func(error)) 
 
 // NewJetStreamNotifier 创建一个基于 NATS JetStream 的通知器。
 // 使用临时消费者（Ephemeral Consumer），进程退出后自动清理，只接收新消息。
-// streamName 为预先创建的 Stream 名称，Serve 会验证其存在。
 // errorHandler 为错误处理回调，若为 nil 则默认打印到 stderr。
-func NewJetStreamNotifier(js nats.JetStreamContext, subject string, streamName string, errorHandler func(error)) Notifier {
-	return notifier.NewJetStreamNotifier(js, subject, streamName, errorHandler)
+func NewJetStreamNotifier(js nats.JetStreamContext, subject string, errorHandler func(error)) Notifier {
+	return notifier.NewJetStreamNotifier(js, subject, errorHandler)
 }
 
 // NewValkeyNotifier 创建一个基于 Valkey Pub/Sub 的通知器。
@@ -75,6 +78,6 @@ func NewValkeyNotifier(client valkey.Client, channel string, errorHandler func(e
 }
 
 // newDefaultNotifier 创建一个基于轮询的默认通知器（Lite 模式内部使用）。
-func newDefaultNotifier(filePath string, maxSize *int64, interval time.Duration, errorHandler func(error)) Notifier {
+func newDefaultNotifier(filePath string, maxSize *int64, interval time.Duration, errorHandler func(error)) (Notifier, error) {
 	return notifier.NewDefault(filePath, maxSize, interval, errorHandler)
 }

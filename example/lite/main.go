@@ -14,11 +14,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/piyongcai-liucai/filerotate"
+	"github.com/piyongcai-liucai/filerotate/example/common"
 )
 
 const (
@@ -39,7 +39,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		monitorRotations(logFile, maxRotate, done)
+		common.MonitorRotations(logFile, maxRotate, done)
 	}()
 
 	for id := 0; id < numProcs; id++ {
@@ -79,30 +79,4 @@ func runLiteProcess(id int, done <-chan struct{}) {
 			id, numProcs, pid, time.Now().Format(time.RFC3339), i)
 		time.Sleep(time.Millisecond)
 	}
-}
-
-func monitorRotations(filePath string, max int, done chan<- struct{}) {
-	base := filepath.Base(filePath)
-	for {
-		count := countBackups(filePath, base)
-		fmt.Printf("\r[监控] 当前备份数: %d/%d", count, max)
-		if count >= max {
-			fmt.Printf("\n[监控] 已达到 %d 次轮转，通知进程退出\n", max)
-			close(done)
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-func countBackups(filePath, base string) int {
-	matches, _ := filepath.Glob(filePath + ".2*")
-	n := 0
-	for _, m := range matches {
-		ext := strings.TrimPrefix(filepath.Base(m), base+".")
-		if len(ext) == 25 && ext[8] == '_' && ext[15] == '.' {
-			n++
-		}
-	}
-	return n
 }

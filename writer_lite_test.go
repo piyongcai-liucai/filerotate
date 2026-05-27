@@ -47,7 +47,7 @@ func TestLiteWriterRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 	defer w.Close()
 
 	// 写入超过阈值的数据
@@ -89,20 +89,28 @@ func TestLiteWriterCleanup(t *testing.T) {
 	oldTime := time.Now().AddDate(0, 0, -10)
 	for i := 0; i < 3; i++ {
 		ts := oldTime.Add(time.Duration(i) * time.Hour).Format("20060102_150405")
-		f, _ := os.Create(path + "." + ts)
+		f, err := os.Create(path + "." + ts)
+		if err != nil {
+			t.Fatalf("创建备份文件失败: %v", err)
+		}
 		f.Close()
-		os.Chtimes(path+"."+ts, oldTime, oldTime)
+		if err := os.Chtimes(path+"."+ts, oldTime, oldTime); err != nil {
+			t.Fatalf("设置备份文件时间失败: %v", err)
+		}
 	}
 
 	recent := time.Now().Format("20060102_150405")
-	f, _ := os.Create(path + "." + recent)
+	f, err := os.Create(path + "." + recent)
+	if err != nil {
+		t.Fatalf("创建备份文件失败: %v", err)
+	}
 	f.Close()
 
 	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 7, PollInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 	defer w.Close()
 
 	_, err = w.Write([]byte(strings.Repeat("x", 100)))
@@ -203,7 +211,7 @@ func TestLiteWriterMultipleRotations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 
 	for i := 0; i < 3; i++ {
 		_, err := w.Write([]byte(strings.Repeat("a", 100)))
@@ -261,7 +269,7 @@ func TestLiteWriterPollingDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 
 	// 写入超过阈值
 	_, err = w.Write([]byte(strings.Repeat("a", 100)))
@@ -284,3 +292,106 @@ func TestLiteWriterPollingDetection(t *testing.T) {
 		t.Fatal("new file should contain data written after rotation")
 	}
 }
+
+// ---------- Lite 模式 rotateIfNeededLite 路径测试 ----------
+
+// TestLiteWriterRotateIfNeeded_FileRemoved 验证文件被外部删除后 rotateIfNeededLite 能重建。
+func TestLiteWriterRotateIfNeeded_FileRemoved(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// 写入数据后删除文件
+	w.Write([]byte("data\n"))
+	time.Sleep(50 * time.Millisecond)
+	os.Remove(path)
+
+	// 手动触发轮转信号 — 文件不存在时 rotateIfNeededLite 应重建
+	w.rotateCh <- struct{}{}
+	time.Sleep(100 * time.Millisecond)
+
+	// Write 应能正常工作（文件已重建）
+	_, err = w.Write([]byte("after removal\n"))
+	if err != nil {
+		t.Fatalf("write after file removal: %v", err)
+	}
+
+	content, _ := os.ReadFile(path)
+	if !strings.Contains(string(content), "after removal") {
+		t.Fatal("file should be recreated")
+	}
+}
+
+// TestLiteWriterRotateIfNeeded_AlreadyRotated 验证外部轮转后 SameFile 检测生效。
+func TestLiteWriterRotateIfNeeded_AlreadyRotated(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	w.Write([]byte("data\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	// 模拟外部轮转：重命名旧文件 + 创建新文件
+	backupPath := path + "." + time.Now().Format("20060102_150405")
+	os.Rename(path, backupPath)
+	defer os.Remove(backupPath)
+	f, _ := os.Create(path)
+	f.Close()
+
+	// 手动触发轮转信号
+	w.rotateCh <- struct{}{}
+	time.Sleep(100 * time.Millisecond)
+
+	// Write 应正常工作（已检测到 inode 变化并重开文件）
+	_, err = w.Write([]byte("after external rotation\n"))
+	if err != nil {
+		t.Fatalf("write after external rotation: %v", err)
+	}
+}
+
+// TestLiteWriterRotateIfNeeded_LockError 验证 TryLock 错误时的错误处理。
+func TestLiteWriterRotateIfNeeded_LockError(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	f, err := openFileAppend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var capturedErr error
+	w := &Writer{
+		lite:         true,
+		file:         f,
+		filePath:     path,
+		rotateLocker: &errorLocker{},
+		rotateCh:     make(chan struct{}, 1),
+		errorHandler: func(err error) { capturedErr = err },
+	}
+
+	w.rotateCh <- struct{}{}
+	w.rotateIfNeededLite()
+
+	if capturedErr == nil {
+		t.Fatal("expected error to be reported")
+	}
+	select {
+	case <-w.rotateCh:
+	default:
+		t.Fatal("expected rotate signal to be requeued")
+	}
+}
+

@@ -27,9 +27,6 @@ type JetStreamNotifier struct {
 	// subject 通信主题，对应的 Stream 必须已包含该 subject
 	subject string
 
-	// streamName Stream 名称，用于 Serve() 验证 Stream 是否存在
-	streamName string
-
 	// sub 订阅句柄，用于取消订阅
 	sub *nats.Subscription
 
@@ -48,14 +45,13 @@ type JetStreamNotifier struct {
 // 参数：
 //   - js: JetStream 上下文，由调用者从 NATS 连接获取
 //   - subject: 通信主题，对应的 Stream 必须已存在且包含该 subject
-//   - streamName: Stream 名称，用于验证 Stream 是否存在
 //   - errorHandler: 错误处理回调，如果为 nil，错误将打印到 stderr
 //
 // 示例：
 //
 //	js, _ := nc.JetStream()
-//	notifier := notifier.NewJetStreamNotifier(js, "filerotate.rotate", "FILEROTATE", nil)
-func NewJetStreamNotifier(js nats.JetStreamContext, subject string, streamName string, errorHandler func(error)) *JetStreamNotifier {
+//	notifier := notifier.NewJetStreamNotifier(js, "filerotate.rotate", nil)
+func NewJetStreamNotifier(js nats.JetStreamContext, subject string, errorHandler func(error)) *JetStreamNotifier {
 	if errorHandler == nil {
 		errorHandler = func(err error) {
 			fmt.Fprintf(os.Stderr, "[JetStream] 错误: %v\n", err)
@@ -64,29 +60,18 @@ func NewJetStreamNotifier(js nats.JetStreamContext, subject string, streamName s
 	return &JetStreamNotifier{
 		js:           js,
 		subject:      subject,
-		streamName:   streamName,
 		msgCh:        make(chan string, 8),
 		errorHandler: errorHandler,
 	}
 }
 
-// Serve 验证 subject 对应的 Stream 是否存在，不创建任何资源。
-//
-// 如果 Stream 不存在，返回错误。
-// Stream 应由运维通过 CLI 或初始化代码预先创建。
-//
-// 返回：
-//   - error: Stream 不存在或其他错误
+// Serve 无操作，Stream 已在构造时验证。
 func (j *JetStreamNotifier) Serve() error {
-	_, err := j.js.StreamInfo(j.streamName)
-	if err != nil {
-		j.reportError(fmt.Errorf("JetStream StreamInfo 失败: %w", err))
-		return fmt.Errorf("filerotate: stream not found: %w", err)
-	}
 	return nil
 }
 
 // Connect 创建临时消费者并订阅，返回命令接收通道。
+// 调用方保证单 goroutine 访问，不内部加锁。
 //
 // 使用 Ephemeral Consumer（不指定 Durable 名称），进程退出后自动清理。
 // 使用 DeliverNew 策略，只接收订阅后发布的新消息，忽略历史消息。
@@ -115,15 +100,19 @@ func (j *JetStreamNotifier) Connect() (<-chan string, error) {
 	}
 	j.sub = sub
 
-	// 启动一个 goroutine 等待订阅结束，并在退出时关闭通道
+	// 为本次连接创建新的 channel，避免旧 goroutine close 后新连接无 channel 可用
+	ch := make(chan string, 8)
+	j.msgCh = ch
+
+	// 捕获 sub 和 ch，防止后续 Connect() 覆盖 j.sub / j.msgCh 导致误操作
 	j.wg.Add(1)
-	go func() {
+	go func(sub *nats.Subscription) {
 		defer j.wg.Done()
-		defer close(j.msgCh)
-		for j.sub.IsValid() {
+		defer close(ch)
+		for sub.IsValid() {
 			time.Sleep(100 * time.Millisecond)
 		}
-	}()
+	}(sub)
 
 	return j.msgCh, nil
 }

@@ -7,11 +7,32 @@ import (
 )
 
 // startLocalServer 启动一个本地通知器服务端，返回通知器实例和清理函数。
+// 通过 Connect 重试循环验证 Serve 已启动成功，避免固定 sleep 的竞态。
 func startLocalServer(t *testing.T, commPath string) (*LocalNotifier, func()) {
 	t.Helper()
 	n := NewLocalNotifier(commPath, discardErrors)
 	go n.Serve()
-	time.Sleep(200 * time.Millisecond)
+
+	// 重试 Connect 直到成功或超时，确保 Serve 已就绪
+	var ch <-chan string
+	var err error
+	for i := 0; i < 20; i++ {
+		ch, err = n.Connect()
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("Serve did not start within timeout: %v", err)
+	}
+
+	// 关闭验证连接，让真正的测试代码自行 Connect
+	go func() {
+		for range ch {
+		}
+	}()
+
 	return n, func() {
 		n.Close()
 		time.Sleep(50 * time.Millisecond)
@@ -83,7 +104,19 @@ func TestLocalNotifierClose(t *testing.T) {
 	n := NewLocalNotifier(testPipe, discardErrors)
 
 	go n.Serve()
-	time.Sleep(100 * time.Millisecond)
+
+	// 通过 Connect 重试验证 Serve 已启动
+	var err error
+	for i := 0; i < 20; i++ {
+		_, err = n.Connect()
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("Serve did not start: %v", err)
+	}
 
 	if err := n.Close(); err != nil {
 		t.Fatalf("close: %v", err)

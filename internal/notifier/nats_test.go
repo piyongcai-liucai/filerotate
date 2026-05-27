@@ -116,3 +116,82 @@ func TestNATSNotifierDifferentSubjects(t *testing.T) {
 		// 预期超时
 	}
 }
+
+// ---------- 边界测试 ----------
+
+func TestNATSNotifier_NilErrorHandler(t *testing.T) {
+	conn := connectNATSOrSkip(t)
+	defer conn.Close()
+	n := NewNATSNotifier(conn, "filerotate.test.nilhandler", nil)
+	defer n.Close()
+
+	// reportError 在 nil handler 时应安全返回
+	n.reportError(nil)
+}
+
+func TestNATSNotifier_CloseWithoutConnect(t *testing.T) {
+	conn := connectNATSOrSkip(t)
+	defer conn.Close()
+	n := NewNATSNotifier(conn, "filerotate.test.noconnect", discardErrors)
+
+	// 未调用 Connect 直接 Close，应安全（走 else 分支关闭初始 channel）
+	if err := n.Close(); err != nil {
+		t.Fatalf("Close without Connect: %v", err)
+	}
+}
+
+func TestNATSNotifier_BroadcastError(t *testing.T) {
+	conn := connectNATSOrSkip(t)
+	n := NewNATSNotifier(conn, "filerotate.test.bcasterr", discardErrors)
+
+	conn.Close() // 关闭连接使后续操作失败
+	err := n.Broadcast("ROTATE")
+	if err == nil {
+		t.Fatal("expected broadcast error after connection close")
+	}
+	n.Close()
+}
+
+func TestNATSNotifier_Reconnect(t *testing.T) {
+	conn := connectNATSOrSkip(t)
+	defer conn.Close()
+	n := NewNATSNotifier(conn, "filerotate.test.reconnect", discardErrors)
+	defer n.Close()
+
+	// 两次 Connect 应安全替换订阅
+	ch1, _ := n.Connect()
+	ch2, _ := n.Connect() // 这次会 Unsubscribe 旧的
+
+	// ch1 应很快关闭（旧订阅被取消）
+	select {
+	case _, ok := <-ch1:
+		if ok {
+			t.Fatal("old channel should be closed after reconnect")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old channel should have been closed")
+	}
+
+	// ch2 应能收到消息
+	time.Sleep(100 * time.Millisecond)
+	n.Broadcast("ROTATE")
+	select {
+	case cmd := <-ch2:
+		if cmd != "ROTATE" {
+			t.Fatalf("expected ROTATE, got %q", cmd)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for message on new channel")
+	}
+}
+
+func TestNATSNotifier_Serve(t *testing.T) {
+	conn := connectNATSOrSkip(t)
+	defer conn.Close()
+	n := NewNATSNotifier(conn, "filerotate.test.serve", discardErrors)
+	defer n.Close()
+
+	if err := n.Serve(); err != nil {
+		t.Fatalf("Serve should return nil: %v", err)
+	}
+}

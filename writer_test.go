@@ -5,10 +5,12 @@
 package filerotate
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -109,7 +111,7 @@ func TestWriterRotation(t *testing.T) {
 	}()
 
 	// 覆盖 maxSize 为 10 字节，使小数据量写入也能触发轮转
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 	time.Sleep(200 * time.Millisecond)
 
 	data := strings.Repeat("a", 100)
@@ -144,13 +146,21 @@ func TestWriterCleanup(t *testing.T) {
 	oldTime := time.Now().AddDate(0, 0, -10)
 	for i := 0; i < 3; i++ {
 		ts := oldTime.Add(time.Duration(i) * time.Hour).Format("20060102_150405")
-		f, _ := os.Create(path + "." + ts)
+		f, err := os.Create(path + "." + ts)
+		if err != nil {
+			t.Fatalf("创建备份文件失败: %v", err)
+		}
 		f.Close()
-		os.Chtimes(path+"."+ts, oldTime, oldTime)
+		if err := os.Chtimes(path+"."+ts, oldTime, oldTime); err != nil {
+			t.Fatalf("设置备份文件时间失败: %v", err)
+		}
 	}
 
 	recent := time.Now().Format("20060102_150405")
-	f, _ := os.Create(path + "." + recent)
+	f, err := os.Create(path + "." + recent)
+	if err != nil {
+		t.Fatalf("创建备份文件失败: %v", err)
+	}
 	f.Close()
 
 	w, err := New(Config{
@@ -168,7 +178,7 @@ func TestWriterCleanup(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}()
 
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 	time.Sleep(200 * time.Millisecond)
 
 	_, err = w.Write([]byte(strings.Repeat("x", 100)))
@@ -252,7 +262,7 @@ func TestWriterWriteAfterRotation(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}()
 
-	w.maxSize = 10
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 
 	_, err = w.Write([]byte(strings.Repeat("a", 100)))
 	if err != nil {
@@ -401,5 +411,274 @@ func TestWriterConcurrentWrites(t *testing.T) {
 	expected := int64(goroutines * writesPer * len(msg))
 	if fi.Size() != expected {
 		t.Fatalf("file size %d, want %d", fi.Size(), expected)
+	}
+}
+
+// ---------- mock 类型 ----------
+
+type errorLocker struct{}
+
+func (e *errorLocker) TryLock() (bool, error) { return false, errors.New("mock error") }
+func (e *errorLocker) Unlock() error           { return nil }
+
+type errorNotifier struct{ broadcastErr error }
+
+func (e *errorNotifier) Serve() error                          { return nil }
+func (e *errorNotifier) Connect() (<-chan string, error)       { ch := make(chan string); return ch, nil }
+func (e *errorNotifier) Broadcast(_ string) error              { return e.broadcastErr }
+func (e *errorNotifier) Close() error                          { return nil }
+
+// ---------- requeueRotate 测试 ----------
+
+func TestReququeueRotate(t *testing.T) {
+	w := &Writer{rotateCh: make(chan struct{}, 1)}
+	w.requeueRotate()
+	select {
+	case <-w.rotateCh:
+	default:
+		t.Fatal("expected signal in rotateCh")
+	}
+}
+
+func TestReququeueRotate_NoDoubleQueue(t *testing.T) {
+	w := &Writer{rotateCh: make(chan struct{}, 1)}
+	w.rotateCh <- struct{}{} // 填满通道
+	w.requeueRotate()        // 不应阻塞（通道已满，丢弃）
+
+	select {
+	case <-w.rotateCh:
+	default:
+		t.Fatal("expected signal in rotateCh")
+	}
+	// 通道应为空（没有第二个信号）
+	select {
+	case <-w.rotateCh:
+		t.Fatal("expected no second signal")
+	default:
+	}
+}
+
+// ---------- tryBecomeLeader 测试 ----------
+
+func TestTryBecomeLeader_TryLockError(t *testing.T) {
+	w := &Writer{
+		leaderLocker: &errorLocker{},
+		errorHandler: silentErrors,
+	}
+	if w.tryBecomeLeader() {
+		t.Fatal("expected false when TryLock returns error")
+	}
+}
+
+// ---------- broadcastRotate 测试 ----------
+
+func TestBroadcastRotate_Error(t *testing.T) {
+	var capturedErr error
+	w := &Writer{
+		notifier:     &errorNotifier{broadcastErr: errors.New("broadcast failed")},
+		errorHandler: func(err error) { capturedErr = err },
+	}
+	w.broadcastRotate()
+	if capturedErr == nil {
+		t.Fatal("expected error to be reported")
+	}
+	if !strings.Contains(capturedErr.Error(), "broadcast failed") {
+		t.Fatalf("unexpected error: %v", capturedErr)
+	}
+}
+
+// ---------- reopenFile 测试 ----------
+
+func TestReopenFile_Error(t *testing.T) {
+	ensureLogDir(t)
+	// 使用目录路径作为文件路径，openFileAppend 应失败
+	dirPath := filepath.Join(logDir, t.Name())
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dirPath)
+
+	w := &Writer{
+		filePath:     dirPath,
+		errorHandler: silentErrors,
+	}
+	if err := w.reopenFile(); err == nil {
+		t.Fatal("expected error reopening with directory path")
+	}
+}
+
+// ---------- openFileAppend 测试 ----------
+
+func TestOpenFileAppend_NonexistentDir(t *testing.T) {
+	_, err := openFileAppend(filepath.Join(logDir, "nonexistent_"+t.Name(), "test.log"))
+	if err == nil {
+		t.Fatal("expected error for nonexistent directory")
+	}
+}
+
+// ---------- 构造错误路径测试 ----------
+
+func TestNew_MkdirAllError(t *testing.T) {
+	ensureLogDir(t)
+	// 创建一个普通文件，然后在它的"子路径"下创建日志文件，
+	// MkdirAll 会因为该文件名已存在（不是目录）而失败
+	blocker := filepath.Join(logDir, t.Name()+"_blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(blocker)
+
+	path := filepath.Join(blocker, "test.log")
+	_, err := New(Config{
+		FilePath:     path,
+		MaxSizeMB:    10,
+		ErrorHandler: silentErrors,
+	})
+	if err == nil {
+		t.Fatal("expected error from MkdirAll")
+	}
+}
+
+func TestNew_LockerFactoryError(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	_, err := New(Config{
+		FilePath:  path,
+		MaxSizeMB: 10,
+		LockerFactory: func(lockPath string) (Locker, error) {
+			return nil, errors.New("custom locker error")
+		},
+		ErrorHandler: silentErrors,
+	})
+	if err == nil {
+		t.Fatal("expected error from LockerFactory")
+	}
+}
+
+func TestNew_NotifierFactoryError(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	_, err := New(Config{
+		FilePath:  path,
+		MaxSizeMB: 10,
+		NotifierFactory: func(commPath string, errorHandler func(error)) (Notifier, error) {
+			return nil, errors.New("custom notifier error")
+		},
+		ErrorHandler: silentErrors,
+	})
+	if err == nil {
+		t.Fatal("expected error from NotifierFactory")
+	}
+}
+
+// ---------- doRotation 测试 ----------
+
+func TestDoRotation_StandardMode(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	// 创建文件并写入一些数据
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("test data")
+	f.Close()
+
+	w := &Writer{
+		filePath:     path,
+		mu:           sync.Mutex{},
+		errorHandler: silentErrors,
+	}
+	// 手动设置 file，doRotation 需要它
+	w.file, err = openFileAppend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.doRotation(); err != nil {
+		t.Fatalf("doRotation failed: %v", err)
+	}
+
+	// 新文件应已创建
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Fatal("new file should exist after rotation")
+	}
+}
+
+// ---------- New 工厂成功路径测试 ----------
+
+func TestNew_CustomNotifierFactorySuccess(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{
+		FilePath:     path,
+		MaxSizeMB:    10,
+		ErrorHandler: silentErrors,
+		NotifierFactory: func(commPath string, errorHandler func(error)) (Notifier, error) {
+			return NewLocalNotifier(commPath, errorHandler), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { w.Close(); time.Sleep(200 * time.Millisecond) }()
+
+	_, err = w.Write([]byte("hello with custom notifier\n"))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func TestNew_CustomLockerFactorySuccess(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{
+		FilePath:      path,
+		MaxSizeMB:     10,
+		ErrorHandler:  silentErrors,
+		LockerFactory: NewFileLocker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { w.Close(); time.Sleep(200 * time.Millisecond) }()
+
+	_, err = w.Write([]byte("hello with custom locker\n"))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// ---------- openFileAppend 错误路径测试 ----------
+
+func TestOpenFileAppend_ReadOnlyFile(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer os.Remove(path)
+
+	// 创建只读文件
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(path, 0o644)
+
+	_, err = openFileAppend(path)
+	if err == nil {
+		t.Fatal("expected error opening read-only file for append")
 	}
 }

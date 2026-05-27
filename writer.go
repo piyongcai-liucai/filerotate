@@ -68,6 +68,8 @@ type Writer struct {
 	lite         bool   // 是否为 Lite 模式（无 Leader 选举，无 IPC）
 	rotateLocker Locker // Lite 模式轮转分布式锁，多进程协调
 
+	lastLeaderFileInfo os.FileInfo // Leader 用于检测外部轮转（inode 变化），仅 ticker goroutine 访问
+
 	done      chan struct{}  // 关闭时通知所有后台 goroutine 退出
 	wg        sync.WaitGroup // 等待后台 goroutine 完全退出
 	closeOnce sync.Once      // 确保 Close 只执行一次
@@ -79,7 +81,7 @@ func New(cfg Config) (*Writer, error) {
 		cfg.CheckInterval = 5 * time.Second
 	}
 	if cfg.LockerFactory == nil {
-		cfg.LockerFactory = func(p string) (Locker, error) { return NewFileLocker(p) }
+		cfg.LockerFactory = NewFileLocker
 	}
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(err error) {
@@ -160,7 +162,6 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 			if err := w.reopenFile(); err != nil {
 				w.reportError(err)
 				w.requeueRotate()
-				return 0, err
 			}
 		}
 	default:
@@ -285,6 +286,12 @@ func (w *Writer) Close() error {
 func (w *Writer) reportError(err error) {
 	if w.errorHandler != nil {
 		w.errorHandler(err)
+	}
+}
+
+func (w *Writer) broadcastRotate() {
+	if err := w.notifier.Broadcast(CmdRotate); err != nil {
+		w.reportError(fmt.Errorf("广播 ROTATE 失败: %w", err))
 	}
 }
 

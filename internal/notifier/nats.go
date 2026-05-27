@@ -6,6 +6,8 @@ package notifier
 import (
 	"fmt"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -30,6 +32,9 @@ type NATSNotifier struct {
 
 	// msgCh 内部命令接收通道，Connect() 返回此通道给调用者
 	msgCh chan string
+
+	// wg 等待订阅监控 goroutine 退出
+	wg sync.WaitGroup
 
 	// errorHandler 错误处理回调，如果为 nil，错误将打印到 stderr
 	errorHandler func(error)
@@ -69,6 +74,7 @@ func (n *NATSNotifier) Serve() error {
 }
 
 // Connect 订阅主题，返回命令接收通道。
+// 调用方保证单 goroutine 访问，不内部加锁。
 //
 // 所有订阅该 subject 的客户端都会收到消息（广播模式）。
 // NATS 的 Subscribe 是异步的，回调函数在收到消息时被调用。
@@ -87,6 +93,21 @@ func (n *NATSNotifier) Connect() (<-chan string, error) {
 		return nil, err
 	}
 	n.sub = sub
+
+	// 为本次连接创建新的 channel，启动 goroutine 监控订阅有效性。
+	// 当 NATS 连接断开时 sub.IsValid() 变为 false，goroutine 关闭 msgCh，
+	// 使 handleCommands 退出，触发 connectToLeader 重连或竞选 Leader。
+	ch := make(chan string, 8)
+	n.msgCh = ch
+	n.wg.Add(1)
+	go func(sub *nats.Subscription) {
+		defer n.wg.Done()
+		defer close(ch)
+		for sub.IsValid() {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}(sub)
+
 	return n.msgCh, nil
 }
 
@@ -99,13 +120,16 @@ func (n *NATSNotifier) Broadcast(cmd string) error {
 	return err
 }
 
-// Close 取消订阅并关闭通道，释放资源。
-// 使用 Drain() 等待所有在途回调完成，避免向已关闭通道发送导致 panic。
+// Close 取消订阅并等待监控 goroutine 退出。
+// Drain() 使 sub 失效，监控 goroutine 检测到后关闭 msgCh 并退出。
 func (n *NATSNotifier) Close() error {
 	if n.sub != nil {
 		n.sub.Drain()
+		n.wg.Wait()
+	} else {
+		// Connect 从未调用，手动关闭初始 channel
+		close(n.msgCh)
 	}
-	close(n.msgCh)
 	return nil
 }
 

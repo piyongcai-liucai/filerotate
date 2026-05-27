@@ -4,6 +4,7 @@
 package filerotate
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -28,7 +29,9 @@ func (w *Writer) runLeader() {
 	go func() {
 		defer w.wg.Done()
 		if err := w.notifier.Serve(); err != nil {
-			w.reportError(fmt.Errorf("Leader Serve 失败: %w", err))
+			if !errors.Is(err, ErrLeaderExists) {
+				w.reportError(fmt.Errorf("Leader Serve 失败: %w", err))
+			}
 		}
 	}()
 
@@ -58,7 +61,16 @@ func (w *Writer) runLeader() {
 		w.handleCommands(cmdCh)
 	}()
 
-	// 定期检查文件大小
+	// 记录当前文件信息，用于检测外部轮转（inode 变化）
+	// 若初始 Stat 失败（如文件不存在），Leader 无法监控轮转，应退出
+	fi, err := os.Stat(w.filePath)
+	if err != nil {
+		w.reportError(fmt.Errorf("Leader 初始化文件状态检查失败: %w", err))
+		return
+	}
+	w.lastLeaderFileInfo = fi
+
+	// 定期检查文件大小和外部轮转
 	ticker := time.NewTicker(w.checkInterval)
 	defer ticker.Stop()
 	for {
@@ -68,20 +80,29 @@ func (w *Writer) runLeader() {
 		case <-ticker.C:
 			fi, err := os.Stat(w.filePath)
 			if err != nil {
-				w.reportError(fmt.Errorf("检查文件大小失败: %w", err))
+				w.reportError(fmt.Errorf("检查文件状态失败: %w", err))
 				continue
 			}
 
-			if w.maxSize > 0 && fi.Size() >= w.maxSize {
+			if !os.SameFile(w.lastLeaderFileInfo, fi) {
+				if err := w.reopenFile(); err != nil {
+					w.reportError(fmt.Errorf("外部轮转后重开文件失败: %w", err))
+					continue
+				}
+				w.broadcastRotate()
+			} else if w.maxSize > 0 && fi.Size() >= w.maxSize {
 				if err := w.doRotation(); err != nil {
 					w.reportError(fmt.Errorf("轮转执行失败: %w", err))
 					continue
 				}
-
-				if err := w.notifier.Broadcast(CmdRotate); err != nil {
-					w.reportError(fmt.Errorf("广播 ROTATE 失败: %w", err))
+				w.broadcastRotate()
+				// 轮转后重新获取文件信息，避免下次 tick 误判为外部轮转
+				if newFi, err := os.Stat(w.filePath); err == nil {
+					fi = newFi
 				}
 			}
+
+			w.lastLeaderFileInfo = fi
 		}
 	}
 }

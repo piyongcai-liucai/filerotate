@@ -78,7 +78,12 @@ func NewLite(cfg LiteConfig) (*Writer, error) {
 	}
 
 	// 创建内置轮询通知器
-	w.notifier = newDefaultNotifier(w.filePath, &w.maxSize, cfg.PollInterval, cfg.ErrorHandler)
+	w.notifier, err = newDefaultNotifier(w.filePath, &w.maxSize, cfg.PollInterval, cfg.ErrorHandler)
+	if err != nil {
+		w.file.Close()
+		w.rotateLocker.Unlock()
+		return nil, fmt.Errorf("create notifier: %w", err)
+	}
 
 	// 启动通知器轮询 goroutine
 	go func() {
@@ -101,6 +106,7 @@ func NewLite(cfg LiteConfig) (*Writer, error) {
 		}
 	}
 	if err != nil {
+		w.notifier.Close()
 		w.file.Close()
 		w.rotateLocker.Unlock()
 		return nil, fmt.Errorf("connect to notifier: %w", err)

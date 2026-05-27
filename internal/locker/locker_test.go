@@ -6,6 +6,7 @@ package locker
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,6 +15,15 @@ import (
 )
 
 // ---------- 辅助函数 ----------
+
+const logDir = "../../example/log"
+
+func ensureLogDir(t *testing.T) {
+	t.Helper()
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("创建日志目录失败: %v", err)
+	}
+}
 
 // connectValkeyOrSkip 尝试连接本地 Valkey/Redis 服务，失败则跳过当前测试。
 // 通过发送 PING 命令验证连接可用性。
@@ -37,7 +47,10 @@ func connectValkeyOrSkip(t *testing.T) valkey.Client {
 // 1. 获取锁后，第二个实例无法获取。
 // 2. 释放锁后，第二个实例可以获取。
 func TestFileLocker(t *testing.T) {
-	path := t.TempDir() + "/test.lock"
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".lock")
+	defer os.Remove(path)
+
 	l, err := NewFileLocker(path)
 	if err != nil {
 		t.Fatal(err)
@@ -67,8 +80,10 @@ func TestFileLocker(t *testing.T) {
 
 // TestFileLockerDirCreation 验证锁文件目录不存在时自动创建。
 func TestFileLockerDirCreation(t *testing.T) {
-	dir := t.TempDir() + "/nonexistent/subdir"
-	lockPath := dir + "/test.lock"
+	ensureLogDir(t)
+	dir := filepath.Join(logDir, t.Name(), "subdir")
+	lockPath := filepath.Join(dir, "test.lock")
+	defer os.RemoveAll(filepath.Join(logDir, t.Name()))
 
 	l, err := NewFileLocker(lockPath)
 	if err != nil {
@@ -237,4 +252,46 @@ func TestValkeyLockerCloseReleasesLock(t *testing.T) {
 		t.Fatalf("TryLock should succeed after Close: ok=%v, err=%v", ok, err)
 	}
 	locker2.Unlock()
+}
+
+// ---------- FileLocker 错误路径测试 ----------
+
+func TestFileLocker_CreateError(t *testing.T) {
+	ensureLogDir(t)
+	// 创建一个普通文件作为路径阻断器，
+	// MkdirAll 会因为该文件名已存在（不是目录）而失败
+	blocker := filepath.Join(logDir, t.Name()+"_blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(blocker)
+
+	_, err := NewFileLocker(filepath.Join(blocker, "test.lock"))
+	if err == nil {
+		t.Fatal("expected error creating lock file")
+	}
+}
+
+func TestFileLocker_TryLockOnDifferentInstance(t *testing.T) {
+	ensureLogDir(t)
+	p1 := filepath.Join(logDir, t.Name()+"_1.lock")
+	p2 := filepath.Join(logDir, t.Name()+"_2.lock")
+	defer os.Remove(p1)
+	defer os.Remove(p2)
+
+	l1, _ := NewFileLocker(p1)
+	l2, _ := NewFileLocker(p2)
+
+	ok, _ := l1.TryLock()
+	if !ok {
+		t.Fatal("first TryLock should succeed")
+	}
+	defer l1.Unlock()
+
+	// 不同路径的锁应独立（非互斥）
+	ok, _ = l2.TryLock()
+	if !ok {
+		t.Fatal("lock on different path should succeed independently")
+	}
+	l2.Unlock()
 }

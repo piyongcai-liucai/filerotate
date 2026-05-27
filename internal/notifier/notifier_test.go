@@ -18,7 +18,7 @@ func discardErrors(_ error) {}
 const cmdRotate = "ROTATE"
 
 // connectNATSOrSkip 尝试连接本地 NATS 服务器，失败则跳过当前测试。
-// 默认连接地址为 nats://localhost:4222。
+// 默认连接地址为 nats://172.20.130.90:4222。
 func connectNATSOrSkip(t *testing.T) *nats.Conn {
 	t.Helper()
 	conn, err := nats.Connect("nats://172.20.130.90:4222")

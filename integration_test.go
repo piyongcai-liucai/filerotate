@@ -187,7 +187,7 @@ func childWriterRotate(filePath string) error {
 	}
 	defer w.Close()
 
-	w.maxSize = 2048 // 覆盖为小阈值，确保多进程写入触发轮转
+	w.maxSize = 2048 // 测试用极小值，int64 在现代平台上原子读写 // 测试用极小值，int64 在现代平台上原子读写
 
 	chunk := strings.Repeat("x", 256)
 	// 分批写入，每批之间 sleep 给 Leader 时间检测文件大小
@@ -282,7 +282,7 @@ func childLiteRotate(filePath string) error {
 	}
 	defer w.Close()
 
-	w.maxSize = 2048
+	w.maxSize = 2048 // 测试用极小值，int64 在现代平台上原子读写
 
 	chunk := strings.Repeat("z", 256)
 	for i := 0; i < 30; i++ {
