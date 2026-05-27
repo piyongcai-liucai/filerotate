@@ -258,12 +258,12 @@ func childWriterFailoverFollower(filePath string) error {
 	return nil
 }
 
-// childLiteBasic 创建 LiteWriter，写入 100 行后退出。
+// childLiteBasic 创建 Lite 模式 Writer，写入 100 行后退出。
 func childLiteBasic(filePath string) error {
-	w, err := NewLiteWriter(LiteConfig{
-		FilePath:      filePath,
-		PerProcSizeMB: 100,
-		MaxAgeDays:    0,
+	w, err := NewLite(LiteConfig{
+		FilePath:   filePath,
+		MaxSizeMB:  100,
+		MaxAgeDays: 0,
 	})
 	if err != nil {
 		return err
@@ -279,19 +279,20 @@ func childLiteBasic(filePath string) error {
 	return nil
 }
 
-// childLiteRotate 创建 LiteWriter（小 perProcSize），写入触发轮转。
+// childLiteRotate 创建 Lite 模式 Writer（小 maxSize），写入触发轮转。
 func childLiteRotate(filePath string) error {
-	w, err := NewLiteWriter(LiteConfig{
-		FilePath:      filePath,
-		PerProcSizeMB: 0,
-		MaxAgeDays:    0,
+	w, err := NewLite(LiteConfig{
+		FilePath:     filePath,
+		MaxSizeMB:    0,
+		MaxAgeDays:   0,
+		PollInterval: 100 * time.Millisecond,
 	})
 	if err != nil {
 		return err
 	}
 	defer w.Close()
 
-	w.perProcSize = 2048
+	w.maxSize = 2048
 
 	chunk := strings.Repeat("z", 256)
 	for i := 0; i < 30; i++ {
@@ -299,7 +300,7 @@ func childLiteRotate(filePath string) error {
 		if _, err := w.Write([]byte(line)); err != nil {
 			return err
 		}
-			time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	return nil
 }

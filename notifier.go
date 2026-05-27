@@ -6,6 +6,8 @@
 package filerotate
 
 import (
+	"time"
+
 	"github.com/nats-io/nats.go"
 	"github.com/valkey-io/valkey-go"
 
@@ -31,6 +33,11 @@ type Notifier interface {
 
 	// Close 关闭通知器，释放资源。
 	Close() error
+}
+
+// resetter 是可重置信号状态的 Notifier（Lite 模式内部使用）。
+type resetter interface {
+	Reset()
 }
 
 const (
@@ -65,4 +72,9 @@ func NewJetStreamNotifier(js nats.JetStreamContext, subject string, streamName s
 // errorHandler 为错误处理回调，若为 nil 则默认打印到 stderr。
 func NewValkeyNotifier(client valkey.Client, channel string, errorHandler func(error)) Notifier {
 	return notifier.NewValkeyNotifier(client, channel, errorHandler)
+}
+
+// newDefaultNotifier 创建一个基于轮询的默认通知器（Lite 模式内部使用）。
+func newDefaultNotifier(filePath string, maxSize *int64, interval time.Duration, errorHandler func(error)) Notifier {
+	return notifier.NewDefault(filePath, maxSize, interval, errorHandler)
 }

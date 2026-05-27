@@ -5,12 +5,16 @@ package filerotate
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
+
+// errFileNotOpen 表示文件未打开时尝试写入。
+var errFileNotOpen = errors.New("filerotate: file not open")
 
 // Config 标准版 Writer 配置。
 type Config struct {
@@ -37,17 +41,20 @@ type Config struct {
 	ErrorHandler func(error)
 }
 
-// Writer 是多进程安全的文件写入器（标准版）。
+// Writer 是多进程安全的文件写入器。
 //
-// 内部通过 Leader 选举和进程间通知协调所有进程。
+// 标准模式：通过 Leader 选举和进程间通知协调所有进程。
 // 所有进程平等竞争 Leader，Leader 负责监控文件大小并广播轮转命令。
+//
+// Lite 模式：无 Leader 选举，无进程间 IPC。每个进程通过内置的
+// polling goroutine 独立检查文件状态，通过分布式锁协调轮转操作。
 //
 // Writer 实现了 io.WriteCloser，可直接与 log.Logger、fmt.Fprint 等配合使用。
 type Writer struct {
-	mu             sync.Mutex    // 保护并发写入和内部状态
+	mu             sync.Mutex    // 保护并发写入和内部状态（标准模式）
 	file           *os.File      // 当前文件句柄，使用 O_APPEND 模式保证多进程安全写入
 	filePath       string        // 文件路径，所有进程必须相同
-	lockPath       string        // 轮转锁文件路径（Lite 版使用，标准版保留用于兼容）
+	lockPath       string        // 轮转锁文件路径
 	leaderLockPath string        // Leader 选举锁路径，用于竞选 Leader
 	maxSize        int64         // 轮转大小阈值（字节），由 MaxSizeMB 转换而来
 	maxAgeDays     int           // 备份保留天数，轮转时自动清理过期备份
@@ -56,6 +63,9 @@ type Writer struct {
 	leaderLocker   Locker        // Leader 选举锁，用于竞选 Leader
 	rotateCh       chan struct{} // 接收轮转通知的通道，收到信号后重开文件
 	errorHandler   func(error)   // 错误处理回调，用于异步报告内部错误
+
+	lite         bool   // 是否为 Lite 模式（无 Leader 选举，无 IPC）
+	rotateLocker Locker // Lite 模式轮转分布式锁，多进程协调
 
 	done      chan struct{} // 关闭时通知所有后台 goroutine 退出
 	wg        sync.WaitGroup // 等待后台 goroutine 完全退出
@@ -118,6 +128,8 @@ func New(cfg Config) (*Writer, error) {
 		w.notifier = NewLocalNotifier(commPath, cfg.ErrorHandler)
 	}
 	if err != nil {
+		w.file.Close()
+		w.leaderLocker.Unlock()
 		return nil, fmt.Errorf("create notifier: %w", err)
 	}
 
@@ -132,34 +144,90 @@ func New(cfg Config) (*Writer, error) {
 	return w, nil
 }
 
-// Write 实现 io.Writer。写入前检查是否有轮转信号，若有则先重开文件。
+// Write 实现 io.Writer。写入前检查是否有轮转信号，若有则先处理轮转。
+// Write 本身不加锁，仅在轮转操作中加锁（标准模式用 mu，Lite 模式用分布式锁）。
 // 若本轮写入期间发生轮转，数据进入备份文件而非新文件，但数据不会丢失，
 // 下次写入时自动重开文件。
 func (w *Writer) Write(p []byte) (n int, err error) {
-	w.mu.Lock()
-
-	if w.file == nil {
-		w.mu.Unlock()
-		return 0, errFileNotOpen
-	}
-
 	// 写入前检查轮转信号
 	select {
 	case <-w.rotateCh:
-		if err := w.reopenFile(); err != nil {
-			w.mu.Unlock()
-			return 0, err
+		if w.lite {
+			w.rotateIfNeededLite()
+		} else {
+			if err := w.reopenFile(); err != nil {
+				return 0, err
+			}
 		}
 	default:
 	}
 
-	n, err = w.file.Write(p)
-	w.mu.Unlock()
-	return n, err
+	f := w.file
+	if f == nil {
+		return 0, errFileNotOpen
+	}
+	return f.Write(p)
 }
 
-// Close 释放资源，关闭文件、通知器和 Leader 锁。
-// 不等待后台 goroutine 完全退出，因为 Windows 命名管道 I/O 无法被可靠中断。
+// rotateIfNeededLite 尝试获取轮转锁，执行轮转或重开文件。
+// 锁竞争失败时只重开文件（其他进程已完成轮转）。
+// 处理完成后重置 notifier 状态，允许下一轮检测。
+func (w *Writer) rotateIfNeededLite() {
+	defer w.resetNotifier()
+
+	ok, lockErr := w.rotateLocker.TryLock()
+	if lockErr != nil {
+		w.reportError(lockErr)
+		return
+	}
+	if !ok {
+		// 其他进程正在轮转，重开文件即可
+		if err := w.reopenFile(); err != nil {
+			w.reportError(err)
+		}
+		return
+	}
+	defer w.rotateLocker.Unlock()
+
+	// 二次确认：检查文件是否已被其他进程轮转
+	currentInfo, err := os.Stat(w.filePath)
+	if err != nil {
+		w.reportError(err)
+		return
+	}
+
+	// 如果文件大小未达阈值，无需轮转
+	if w.maxSize > 0 && currentInfo.Size() < w.maxSize {
+		return
+	}
+
+	// 执行轮转
+	if err := w.doRotationLite(); err != nil {
+		w.reportError(err)
+	}
+}
+
+// resetNotifier 通知 notifier 本轮处理已完成，可继续检测。
+func (w *Writer) resetNotifier() {
+	if r, ok := w.notifier.(resetter); ok {
+		r.Reset()
+	}
+}
+
+// doRotationLite Lite 模式的文件轮转：重命名、重开。
+// 不提前关闭文件——reopenFile 会先打开新文件再关旧文件，确保 w.file 始终非 nil。
+func (w *Writer) doRotationLite() error {
+	if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
+		w.reportError(err)
+		if reopenErr := w.reopenFile(); reopenErr != nil {
+			return reopenErr
+		}
+		return err
+	}
+	return w.reopenFile()
+}
+
+// Close 释放资源，关闭文件、通知器和锁。
 func (w *Writer) Close() error {
 	var err error
 	w.closeOnce.Do(func() {
@@ -169,11 +237,21 @@ func (w *Writer) Close() error {
 			w.notifier.Close()
 		}
 
+		if w.lite {
+			w.wg.Wait()
+		}
+
 		w.mu.Lock()
 		defer w.mu.Unlock()
 
-		if w.leaderLocker != nil {
-			w.leaderLocker.Unlock()
+		if w.lite {
+			if w.rotateLocker != nil {
+				w.rotateLocker.Unlock()
+			}
+		} else {
+			if w.leaderLocker != nil {
+				w.leaderLocker.Unlock()
+			}
 		}
 		if w.file != nil {
 			err = w.file.Close()
@@ -253,17 +331,14 @@ func (w *Writer) handleCommands(ch <-chan string) {
 	}
 }
 
-// doRotation 执行文件轮转：关闭当前文件、重命名为备份、创建新文件、重开。
+// doRotation 执行文件轮转：重命名为备份、创建新文件、重开。
+// 不提前关闭文件——reopenFile 会先打开新文件再关旧文件，确保 w.file 始终非 nil。
 // 即使 doFileRotation 部分失败（如 rename 后 create 失败），也会尝试 reopenFile，
 // 因为 openFileAppend 使用 O_CREATE 会自动创建不存在的文件。
 func (w *Writer) doRotation() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.file != nil {
-		w.file.Close()
-		w.file = nil
-	}
 	if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
 		w.reportError(fmt.Errorf("轮转失败: %w", err))
 		// 即使轮转部分失败也尝试重开文件，避免文件句柄为空

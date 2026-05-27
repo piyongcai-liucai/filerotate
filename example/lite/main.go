@@ -1,4 +1,4 @@
-// Lite 版示例：模拟 3 个进程并发写入，无 IPC，仅通过分布式锁协调轮转。
+// Lite 版示例：模拟 3 个进程并发写入，无 IPC，通过内置轮询和分布式锁协调轮转。
 //
 // 运行多个实例可验证真正的跨进程协调：
 //
@@ -6,7 +6,7 @@
 //	go run .          # 终端 2
 //	go run .          # 终端 3
 //
-// 每个进程独立追踪本地写入量，达到 PerProcSizeMB 阈值后尝试获取分布式锁执行轮转。
+// 每个进程通过内置 goroutine 定期检查文件大小，超阈值后通过分布式锁竞争执行轮转。
 // 总共轮转 10 次后自动退出。
 package main
 
@@ -30,7 +30,7 @@ const (
 
 func main() {
 	fmt.Printf("=== Lite 版多进程示例 ===\n")
-	fmt.Printf("进程数: %d | 每进程轮转阈值: %d MB | 目标轮转次数: %d\n", numProcs, maxSizeMB, maxRotate)
+	fmt.Printf("进程数: %d | 轮转阈值: %d MB | 目标轮转次数: %d\n", numProcs, maxSizeMB, maxRotate)
 
 	os.MkdirAll(filepath.Dir(logFile), 0o755)
 
@@ -55,13 +55,13 @@ func main() {
 }
 
 func runLiteProcess(id int, done <-chan struct{}) {
-	writer, err := filerotate.NewLiteWriter(filerotate.LiteConfig{
-		FilePath:      logFile,
-		PerProcSizeMB: maxSizeMB,
-		MaxAgeDays:    7,
+	writer, err := filerotate.NewLite(filerotate.LiteConfig{
+		FilePath:   logFile,
+		MaxSizeMB:  maxSizeMB,
+		MaxAgeDays: 7,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[进程 %d] 创建 LiteWriter 失败: %v\n", id, err)
+		fmt.Fprintf(os.Stderr, "[进程 %d] 创建 Writer 失败: %v\n", id, err)
 		return
 	}
 	defer writer.Close()
@@ -75,7 +75,7 @@ func runLiteProcess(id int, done <-chan struct{}) {
 		default:
 		}
 
-		fmt.Fprintf(writer, "[进程 %d/%d PID %d] %s 第 %d 条日志 —— Lite版文件锁协调示例\n",
+		fmt.Fprintf(writer, "[进程 %d/%d PID %d] %s 第 %d 条日志 —— Lite版内置轮询示例\n",
 			id, numProcs, pid, time.Now().Format(time.RFC3339), i)
 		time.Sleep(time.Millisecond)
 	}

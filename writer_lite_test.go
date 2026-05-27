@@ -1,5 +1,5 @@
-// lite_writer_test.go
-// Lite 版 Writer 的单元测试。
+// writer_lite_test.go
+// Lite 模式 Writer 的单元测试。
 // 所有日志文件均写入 ./example/log 目录，避免系统临时目录的权限问题。
 package filerotate
 
@@ -11,15 +11,13 @@ import (
 	"time"
 )
 
-// isBackupFile 已在 writer_test.go 中定义，这里直接使用
-
 // TestLiteWriterBasic 验证基本写入功能。
 func TestLiteWriterBasic(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, "TestLiteWriterBasic.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 10, MaxAgeDays: 0})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,25 +37,35 @@ func TestLiteWriterBasic(t *testing.T) {
 	}
 }
 
-// TestLiteWriterRotation 验证本地计数达到阈值后触发轮转。
+// TestLiteWriterRotation 验证写入超过阈值后经 notifier 轮询触发轮转。
 func TestLiteWriterRotation(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, "TestLiteWriterRotation.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 0, MaxAgeDays: 0})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, PollInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.perProcSize = 10
+	w.maxSize = 10
 	defer w.Close()
 
+	// 写入超过阈值的数据
 	_, err = w.Write([]byte(strings.Repeat("a", 100)))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// 检查真正的备份文件
+	// 等待 notifier 轮询检测到文件大小超阈值并发送 ROTATE
+	time.Sleep(200 * time.Millisecond)
+
+	// 再次写入，Write() 会收到 ROTATE 信号并执行轮转
+	_, err = w.Write([]byte("trigger\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 检查备份文件
 	base := filepath.Base(path)
 	matches, _ := filepath.Glob(path + ".*")
 	found := false
@@ -90,14 +98,21 @@ func TestLiteWriterCleanup(t *testing.T) {
 	f, _ := os.Create(path + "." + recent)
 	f.Close()
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 10, MaxAgeDays: 7})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 7, PollInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.perProcSize = 10
+	w.maxSize = 10
 	defer w.Close()
 
 	_, err = w.Write([]byte(strings.Repeat("x", 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	_, err = w.Write([]byte("trigger\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +135,7 @@ func TestLiteWriterConcurrent(t *testing.T) {
 	path := filepath.Join(logDir, "TestLiteWriterConcurrent.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 10, MaxAgeDays: 0})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +177,7 @@ func TestLiteWriterEmptyWrite(t *testing.T) {
 	path := filepath.Join(logDir, "TestLiteWriterEmptyWrite.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 10, MaxAgeDays: 0})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,18 +198,20 @@ func TestLiteWriterMultipleRotations(t *testing.T) {
 	path := filepath.Join(logDir, "TestLiteWriterMultipleRotations.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 0, MaxAgeDays: 0})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, PollInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	w.perProcSize = 10
+	w.maxSize = 10
 
 	for i := 0; i < 3; i++ {
 		_, err := w.Write([]byte(strings.Repeat("a", 100)))
 		if err != nil {
 			t.Fatalf("write %d: %v", i, err)
 		}
+		// 等待 notifier 检测并发送 ROTATE，下一次 Write 执行轮转
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	base := filepath.Base(path)
@@ -216,7 +233,7 @@ func TestLiteWriterCloseAndWrite(t *testing.T) {
 	path := filepath.Join(logDir, "TestLiteWriterCloseAndWrite.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{FilePath: path, PerProcSizeMB: 10, MaxAgeDays: 0})
+	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,39 +245,42 @@ func TestLiteWriterCloseAndWrite(t *testing.T) {
 	}
 }
 
-// TestLiteWriterTimeIntervalCheck 验证时间间隔检查触发轮转。
-func TestLiteWriterTimeIntervalCheck(t *testing.T) {
+// TestLiteWriterPollingDetection 验证 notifier 轮询检测到其他进程轮转后，本进程能重开文件。
+func TestLiteWriterPollingDetection(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterTimeIntervalCheck.log")
+	path := filepath.Join(logDir, "TestLiteWriterPollingDetection.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLiteWriter(LiteConfig{
-		FilePath:         path,
-		PerProcSizeMB:    100,
-		MaxWriteInterval: 100 * time.Millisecond,
+	w, err := NewLite(LiteConfig{
+		FilePath:     path,
+		MaxSizeMB:    0,
+		MaxAgeDays:   0,
+		PollInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
+	w.maxSize = 10
 
-	w.Write([]byte("first\n"))
-	time.Sleep(200 * time.Millisecond)
-	_, err = w.Write([]byte("second\n"))
+	// 写入超过阈值
+	_, err = w.Write([]byte(strings.Repeat("a", 100)))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	base := filepath.Base(path)
-	matches, _ := filepath.Glob(path + ".*")
-	found := false
-	for _, m := range matches {
-		if isBackupFile(base, filepath.Base(m)) {
-			found = true
-			break
-		}
+	// 等待 notifier 检测到大小超阈值并发送 ROTATE
+	time.Sleep(200 * time.Millisecond)
+
+	// 再次写入触发轮转
+	_, err = w.Write([]byte("after rotation\n"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !found {
-		t.Fatal("expected backup file after time interval check")
+
+	// 当前文件应该只有 "after rotation\n"
+	content, _ := os.ReadFile(path)
+	if !strings.Contains(string(content), "after rotation") {
+		t.Fatal("new file should contain data written after rotation")
 	}
 }
