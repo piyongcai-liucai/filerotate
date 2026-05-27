@@ -64,16 +64,6 @@ func runChildProcess() {
 
 // ========== 子进程辅助函数 ==========
 
-// executable returns the path to the test binary, failing the test if unavailable.
-func executable(t *testing.T) string {
-	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatalf("获取可执行文件路径失败: %v", err)
-	}
-	return exe
-}
-
 // runChild starts a child process and waits for it. Returns its combined output.
 func runChild(role, filePath string, timeout time.Duration, extraEnv ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)

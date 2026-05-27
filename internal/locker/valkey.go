@@ -7,7 +7,6 @@ package locker
 import (
 	"context"
 	"strings"
-	"sync"
 
 	"github.com/valkey-io/valkey-go/valkeylock"
 )
@@ -24,8 +23,6 @@ import (
 //
 // 适用于跨主机共享存储（如 NFS）或需要高可用的场景。
 type ValkeyLocker struct {
-	mu sync.Mutex // 保护 TryLock/Unlock 的并发安全
-
 	// locker 是 valkeylock 库返回的锁接口实例
 	locker valkeylock.Locker
 
@@ -68,9 +65,6 @@ func NewValkeyLocker(option valkeylock.LockerOption, key string) (*ValkeyLocker,
 //   - bool: true 表示获取成功，false 表示锁被其他进程持有
 //   - error: 仅当发生网络故障等严重错误时返回非 nil；普通锁竞争时返回 (false, nil)
 func (v *ValkeyLocker) TryLock() (bool, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
 	// 防止同一个实例重复加锁
 	if v.cancel != nil {
 		return false, nil
@@ -105,9 +99,6 @@ func (v *ValkeyLocker) TryLock() (bool, error) {
 // 返回:
 //   - error: 释放过程中的错误（通常为 nil）
 func (v *ValkeyLocker) Unlock() error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
 	if v.cancel != nil {
 		v.cancel()
 		v.cancel = nil
