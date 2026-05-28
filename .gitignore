@@ -3,5 +3,4 @@
 
 *.log*
 filerotate_*
-
-example/log/*
+log/

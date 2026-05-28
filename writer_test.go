@@ -1,12 +1,8 @@
 // writer_test.go
-// 标准版 Writer 的单元测试。
-// 测试覆盖基本写入、轮转、备份清理、Leader故障恢复以及并发写入安全性。
-// 所有日志文件均写入 ./example/log 目录，避免系统临时目录的权限问题。
+// Writer 的单元测试。
 package filerotate
 
 import (
-	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +11,7 @@ import (
 	"time"
 )
 
-const logDir = "./example/log"
+const logDir = "./log"
 
 // silentErrors 静默丢弃错误，避免测试中预期的错误输出污染测试日志。
 func silentErrors(_ error) {}
@@ -200,48 +196,6 @@ func TestWriterCleanup(t *testing.T) {
 	}
 }
 
-// TestWriterLeaderFailover 验证Leader崩溃后其他进程能够接管。
-func TestWriterLeaderFailover(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestWriterLeaderFailover.log")
-	defer cleanupLogs(t, path)
-
-	w1, err := New(Config{
-		FilePath:      path,
-		MaxSizeMB:     0,
-		CheckInterval: 50 * time.Millisecond,
-		ErrorHandler:  silentErrors,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	w1.maxSize = 10
-
-	w2, err := New(Config{
-		FilePath:      path,
-		MaxSizeMB:     0,
-		CheckInterval: 50 * time.Millisecond,
-		ErrorHandler:  silentErrors,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	w2.maxSize = 10
-
-	w1.Close()
-	time.Sleep(200 * time.Millisecond)
-
-	defer func() {
-		w2.Close()
-		time.Sleep(200 * time.Millisecond)
-	}()
-
-	_, err = w2.Write([]byte("hello after failover\n"))
-	if err != nil {
-		t.Fatalf("write after failover: %v", err)
-	}
-}
-
 // TestWriterWriteAfterRotation 验证轮转后新文件能继续接收写入。
 func TestWriterWriteAfterRotation(t *testing.T) {
 	ensureLogDir(t)
@@ -281,28 +235,6 @@ func TestWriterWriteAfterRotation(t *testing.T) {
 	}
 }
 
-// TestWriterDoubleClose 验证多次调用 Close 不会 panic（sync.Once 保护）。
-func TestWriterDoubleClose(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestWriterDoubleClose.log")
-	defer cleanupLogs(t, path)
-
-	w, err := New(Config{
-		FilePath:     path,
-		MaxSizeMB:    10,
-		ErrorHandler: silentErrors,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := w.Close(); err != nil {
-		t.Fatalf("first close: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("second close: %v", err)
-	}
-}
 
 // TestWriterCloseWrite 验证关闭后写入应报错。
 func TestWriterCloseWrite(t *testing.T) {
@@ -325,28 +257,6 @@ func TestWriterCloseWrite(t *testing.T) {
 		t.Fatal("expected error after close")
 	}
 }
-
-// TestWriterNewLockerFactoryError 验证 LockerFactory 返回错误时 New 应失败。
-func TestWriterNewLockerFactoryError(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestWriterNewLockerFactoryError.log")
-	defer cleanupLogs(t, path)
-
-	_, err := New(Config{
-		FilePath:  path,
-		MaxSizeMB: 10,
-		LockerFactory: func(lockPath string) (Locker, error) {
-			return nil, fmt.Errorf("custom locker error")
-		},
-		NotifierFactory: func(errorHandler func(error)) (Notifier, error) { return &errorNotifier{}, nil },
-		ErrorHandler: silentErrors,
-	})
-	if err == nil {
-		t.Fatal("expected error from LockerFactory")
-	}
-}
-
-
 
 // TestWriterConcurrentWrites 验证并发写入安全性。
 func TestWriterConcurrentWrites(t *testing.T) {
@@ -398,21 +308,7 @@ func TestWriterConcurrentWrites(t *testing.T) {
 	}
 }
 
-// ---------- mock 类型 ----------
 
-type errorLocker struct{}
-
-func (e *errorLocker) TryLock() (bool, error) { return false, errors.New("mock error") }
-func (e *errorLocker) Unlock() error           { return nil }
-
-type errorNotifier struct{ broadcastErr error }
-
-func (e *errorNotifier) Serve() error                          { return nil }
-func (e *errorNotifier) Connect() (<-chan string, error)       { ch := make(chan string); return ch, nil }
-func (e *errorNotifier) Broadcast(_ string) error              { return e.broadcastErr }
-func (e *errorNotifier) Close() error                          { return nil }
-
-// ---------- requeueRotate 测试 ----------
 
 func TestReququeueRotate(t *testing.T) {
 	w := &Writer{rotateCh: make(chan struct{}, 1)}
@@ -442,36 +338,8 @@ func TestReququeueRotate_NoDoubleQueue(t *testing.T) {
 	}
 }
 
-// ---------- tryBecomeLeader 测试 ----------
 
-func TestTryBecomeLeader_TryLockError(t *testing.T) {
-	w := &Writer{
-		leaderLocker: &errorLocker{},
-		errorHandler: silentErrors,
-	}
-	if w.tryBecomeLeader() {
-		t.Fatal("expected false when TryLock returns error")
-	}
-}
 
-// ---------- broadcastRotate 测试 ----------
-
-func TestBroadcastRotate_Error(t *testing.T) {
-	var capturedErr error
-	w := &Writer{
-		notifier:     &errorNotifier{broadcastErr: errors.New("broadcast failed")},
-		errorHandler: func(err error) { capturedErr = err },
-	}
-	w.broadcastRotate()
-	if capturedErr == nil {
-		t.Fatal("expected error to be reported")
-	}
-	if !strings.Contains(capturedErr.Error(), "broadcast failed") {
-		t.Fatalf("unexpected error: %v", capturedErr)
-	}
-}
-
-// ---------- reopenFile 测试 ----------
 
 func TestReopenFile_Error(t *testing.T) {
 	ensureLogDir(t)
@@ -491,7 +359,6 @@ func TestReopenFile_Error(t *testing.T) {
 	}
 }
 
-// ---------- openFileAppend 测试 ----------
 
 func TestOpenFileAppend_NonexistentDir(t *testing.T) {
 	_, err := openFileAppend(filepath.Join(logDir, "nonexistent_"+t.Name(), "test.log"))
@@ -500,7 +367,6 @@ func TestOpenFileAppend_NonexistentDir(t *testing.T) {
 	}
 }
 
-// ---------- 构造错误路径测试 ----------
 
 func TestNew_MkdirAllError(t *testing.T) {
 	ensureLogDir(t)
@@ -523,45 +389,8 @@ func TestNew_MkdirAllError(t *testing.T) {
 	}
 }
 
-func TestNew_LockerFactoryError(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, t.Name()+".log")
-	defer cleanupLogs(t, path)
 
-	_, err := New(Config{
-		FilePath:  path,
-		MaxSizeMB: 10,
-		LockerFactory: func(lockPath string) (Locker, error) {
-			return nil, errors.New("custom locker error")
-		},
-		NotifierFactory: func(errorHandler func(error)) (Notifier, error) { return &errorNotifier{}, nil },
-		ErrorHandler: silentErrors,
-	})
-	if err == nil {
-		t.Fatal("expected error from LockerFactory")
-	}
-}
 
-// TestNew_NotifierWithoutLocker 验证标准模式下设置通知器但未设置锁工厂时报错。
-func TestNew_NotifierWithoutLocker(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, t.Name()+".log")
-	defer cleanupLogs(t, path)
-
-	_, err := New(Config{
-		FilePath:     path,
-		MaxSizeMB:    10,
-		NotifierFactory: func(errorHandler func(error)) (Notifier, error) {
-			return &errorNotifier{}, nil
-		},
-		ErrorHandler: silentErrors,
-	})
-	if err == nil {
-		t.Fatal("expected error when NotifierFactory is set but LockerFactory is nil")
-	}
-}
-
-// ---------- doRotation 测试 ----------
 
 func TestDoRotation_StandardMode(t *testing.T) {
 	ensureLogDir(t)
@@ -597,36 +426,6 @@ func TestDoRotation_StandardMode(t *testing.T) {
 	}
 }
 
-// ---------- New 工厂成功路径测试 ----------
-
-
-
-func TestNew_CustomLockerFactorySuccess(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, t.Name()+".log")
-	defer cleanupLogs(t, path)
-
-	w, err := New(Config{
-		FilePath:      path,
-		MaxSizeMB:     10,
-		ErrorHandler:  silentErrors,
-		LockerFactory: newLocalLocker,
-		NotifierFactory: func(errorHandler func(error)) (Notifier, error) {
-			return &errorNotifier{}, nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { w.Close(); time.Sleep(200 * time.Millisecond) }()
-
-	_, err = w.Write([]byte("hello with custom locker\n"))
-	if err != nil {
-		t.Fatalf("write: %v", err)
-	}
-}
-
-// ---------- openFileAppend 错误路径测试 ----------
 
 func TestOpenFileAppend_ReadOnlyFile(t *testing.T) {
 	ensureLogDir(t)
@@ -647,5 +446,244 @@ func TestOpenFileAppend_ReadOnlyFile(t *testing.T) {
 	_, err = openFileAppend(path)
 	if err == nil {
 		t.Fatal("expected error opening read-only file for append")
+	}
+}
+
+// TestWriterConcurrent 验证多 goroutine 并发写入的安全性。
+func TestWriterConcurrent(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, "TestWriterConcurrent.log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	const goroutines = 5
+	const writes = 20
+	msg := "test\n"
+
+	errCh := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			for j := 0; j < writes; j++ {
+				if _, err := w.Write([]byte(msg)); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}()
+	}
+
+	for i := 0; i < goroutines; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fi, _ := os.Stat(path)
+	expected := int64(goroutines * writes * len(msg))
+	if fi.Size() != expected {
+		t.Fatalf("file size %d, want %d", fi.Size(), expected)
+	}
+}
+
+// TestWriterEmptyWrite 验证空写入。
+func TestWriterEmptyWrite(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, "TestWriterEmptyWrite.log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	n, err := w.Write([]byte{})
+	if err != nil {
+		t.Fatalf("empty write: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected 0 bytes, got %d", n)
+	}
+}
+
+// TestWriterMultipleRotations 验证多次轮转。
+func TestWriterMultipleRotations(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, "TestWriterMultipleRotations.log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, CheckInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
+
+	for i := 0; i < 3; i++ {
+		_, err := w.Write([]byte(strings.Repeat("a", 100)))
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	base := filepath.Base(path)
+	matches, _ := filepath.Glob(path + ".*")
+	count := 0
+	for _, m := range matches {
+		if isBackupFile(base, filepath.Base(m)) {
+			count++
+		}
+	}
+	if count < 2 {
+		t.Fatalf("expected at least 2 backup files, got %d", count)
+	}
+}
+
+// TestWriterCloseAndWrite 验证关闭后写入应报错。
+func TestWriterCloseAndWrite(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, "TestWriterCloseAndWrite.log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	_, err = w.Write([]byte("hello\n"))
+	if err == nil {
+		t.Fatal("expected error after close")
+	}
+}
+
+// TestWriterPollingDetection 验证轮询检测到文件大小超阈值后能触发轮转。
+func TestWriterPollingDetection(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, "TestWriterPollingDetection.log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{
+		FilePath:      path,
+		MaxSizeMB:     0,
+		MaxAgeDays:    0,
+		CheckInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
+
+	_, err = w.Write([]byte(strings.Repeat("a", 100)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	_, err = w.Write([]byte("after rotation\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content, _ := os.ReadFile(path)
+	if !strings.Contains(string(content), "after rotation") {
+		t.Fatal("new file should contain data written after rotation")
+	}
+}
+
+// TestWriter_FileRemovedRecreates 验证文件被外部删除后 Write() 能通过 reopenFile 重建。
+func TestWriter_FileRemovedRecreates(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	w.Write([]byte("data\n"))
+	time.Sleep(50 * time.Millisecond)
+	os.Remove(path)
+
+	w.rotateCh <- struct{}{}
+	time.Sleep(100 * time.Millisecond)
+
+	_, err = w.Write([]byte("after removal\n"))
+	if err != nil {
+		t.Fatalf("write after file removal: %v", err)
+	}
+
+	content, _ := os.ReadFile(path)
+	if !strings.Contains(string(content), "after removal") {
+		t.Fatal("file should be recreated")
+	}
+}
+
+// TestWriter_ExternalRotationReopen 验证外部轮转后 Write() 能重开新文件。
+func TestWriter_ExternalRotationReopen(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	w.Write([]byte("data\n"))
+	time.Sleep(50 * time.Millisecond)
+
+	backupPath := path + "." + time.Now().Format("20060102_150405")
+	os.Rename(path, backupPath)
+	defer os.Remove(backupPath)
+	f, _ := os.Create(path)
+	f.Close()
+
+	w.rotateCh <- struct{}{}
+	time.Sleep(100 * time.Millisecond)
+
+	_, err = w.Write([]byte("after external rotation\n"))
+	if err != nil {
+		t.Fatalf("write after external rotation: %v", err)
+	}
+}
+
+// TestWriter_TwoWritersCoexist 验证两个 Writer 共存且各自独立工作。
+func TestWriter_TwoWritersCoexist(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w1, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w1.Close()
+
+	w2, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	_, err = w1.Write([]byte("from w1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = w2.Write([]byte("from w2\n"))
+	if err != nil {
+		t.Fatal(err)
 	}
 }
