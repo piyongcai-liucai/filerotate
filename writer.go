@@ -1,6 +1,6 @@
 // Package filerotate 提供多进程安全的文件轮转功能。
 //
-// 本文件实现标准版 Writer，通过 Leader 选举和进程间通知协调多进程文件轮转。
+// 本文件实现 Writer 核心逻辑：Write、Close、doRotation 及标准模式（Leader 选举 + 通知器）。
 package filerotate
 
 import (
@@ -15,7 +15,7 @@ import (
 // errFileNotOpen 表示文件未打开时尝试写入。
 var errFileNotOpen = errors.New("filerotate: file not open")
 
-// Config 标准版 Writer 配置。
+// Config Writer 配置，同时用于单机模式和标准模式。
 type Config struct {
 	// FilePath 文件路径。所有并发进程必须使用相同的路径。
 	FilePath string
@@ -26,15 +26,14 @@ type Config struct {
 	// MaxAgeDays 备份文件保留天数。0 表示永不删除。轮转时自动清理过期备份。
 	MaxAgeDays int
 
-	// CheckInterval Leader 检查文件大小的间隔。默认 5 秒。
+	// CheckInterval 检查文件大小的间隔。默认值取决于模式：单机 1s，标准 5s。
 	CheckInterval time.Duration
 
-	// LockerFactory 自定义锁工厂函数。若为 nil，使用默认文件锁。
-	// 若工厂返回错误，Writer 创建将失败。
+	// LockerFactory 自定义锁工厂函数。标准模式必须设置，单机模式忽略（始终用 LocalLocker）。
 	LockerFactory func(lockPath string) (Locker, error)
 
 	// NotifierFactory 自定义通知器工厂函数。若为 nil，使用基于文件轮询的默认通知器。
-	// 跨主机场景（NFS + IPC）时可注入 NATS / JetStream / Valkey 等通知器。
+	// 跨主机场景（NFS + 跨进程通知）时可注入 NATS / JetStream / Valkey 等通知器。
 	NotifierFactory func(errorHandler func(error)) (Notifier, error)
 
 	// ErrorHandler 当内部 goroutine 发生错误时调用。如果为 nil，错误将打印到 stderr。
@@ -46,7 +45,7 @@ type Config struct {
 // 标准模式：通过 Leader 选举和进程间通知协调所有进程。
 // 所有进程平等竞争 Leader，Leader 负责监控文件大小并广播轮转命令。
 //
-// 单机（Local）模式：无 Leader 选举，无进程间 IPC。每个进程通过内置的
+// 单机（Local）模式：无 Leader 选举，无进程间通信。每个进程通过内置的
 // polling goroutine 独立检查文件状态，通过分布式锁协调轮转操作。
 //
 // Writer 实现了 io.WriteCloser，可直接与 log.Logger、fmt.Fprint 等配合使用。
@@ -59,12 +58,12 @@ type Writer struct {
 	maxSize        int64         // 轮转大小阈值（字节），由 MaxSizeMB 转换而来
 	maxAgeDays     int           // 备份保留天数，轮转时自动清理过期备份
 	checkInterval  time.Duration // Leader 检查文件大小的间隔
-	notifier       Notifier      // 进程间通知器，Leader 通过它广播命令
-	leaderLocker   Locker        // Leader 选举锁，用于竞选 Leader
+	notifier       Notifier      // 通知器：单机模式为 LocalNotifier，标准模式为自定义 跨进程通知器
+	leaderLocker   Locker        // Leader 选举锁，仅标准模式使用，单机模式为 nil
 	rotateCh       chan struct{} // 接收轮转通知的通道，收到信号后重开文件
 	errorHandler   func(error)   // 错误处理回调，用于异步报告内部错误
 
-	local        bool   // 是否为单机（Local）模式（无 Leader 选举，无 IPC）
+	local        bool   // 是否为单机（Local）模式（无 Leader 选举，无进程间通信）
 	rotateLocker Locker // 单机模式轮转分布式锁，多进程协调
 
 	lastLeaderFileInfo os.FileInfo // Leader 用于检测外部轮转（inode 变化），仅 ticker goroutine 访问
@@ -79,7 +78,7 @@ type Writer struct {
 // 根据 NotifierFactory 自动选择模式：
 //   - NotifierFactory == nil：单机模式，使用内置 LocalNotifier 轮询 + 分布式锁协调多进程。
 //     所有进程平等，无 Leader 选举。
-//   - NotifierFactory != nil：标准模式，使用自定义 IPC 通知器 + Leader 选举协调多进程。
+//   - NotifierFactory != nil：标准模式，使用自定义 跨进程通知器 + Leader 选举协调多进程。
 func New(cfg Config) (*Writer, error) {
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(err error) {
@@ -97,7 +96,7 @@ func New(cfg Config) (*Writer, error) {
 }
 
 
-// newStandard 创建标准模式 Writer（IPC 通知 + Leader 选举）。
+// newStandard 创建标准模式 Writer（跨进程通知 + Leader 选举）。
 func newStandard(cfg Config) (*Writer, error) {
 	if cfg.CheckInterval == 0 {
 		cfg.CheckInterval = 5 * time.Second
@@ -165,7 +164,7 @@ func newStandard(cfg Config) (*Writer, error) {
 }
 
 // Write 实现 io.Writer。写入前检查是否有轮转信号，若有则先处理轮转。
-// Write 本身不加锁，仅在轮转操作中加锁（标准模式用 mu，单机模式用分布式锁）。
+// Write 本身不加锁（依赖 O_APPEND 内核级原子写入），轮转时 doRotation 加 mu 锁。
 // 若本轮写入期间发生轮转，数据进入备份文件而非新文件，但数据不会丢失，
 // 下次写入时自动重开文件。
 func (w *Writer) Write(p []byte) (n int, err error) {
@@ -215,7 +214,7 @@ func (w *Writer) Close() error {
 		}
 
 		// 单机模式：LocalNotifier 的 Serve 在 Close 时能正常退出，Wait 安全。
-		// 标准模式：IPC notifier 的 Serve 可能仍在 Accept 上阻塞，不 Wait。
+		// 标准模式：跨进程 notifier 的 Serve 可能仍在 Accept 上阻塞，不 Wait。
 		if w.local {
 			w.wg.Wait()
 		}

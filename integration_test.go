@@ -460,7 +460,7 @@ func TestMultiProcLocalWriterRotation(t *testing.T) {
 	t.Logf("找到 %d 个备份文件", backupCount)
 
 	// 统计所有文件（当前文件 + 备份文件）中的总行数，验证数据不丢失。
-	// LocalWriter 无 IPC，进程可能将数据写入已被其他进程轮转的旧文件句柄，
+	// LocalWriter 无进程间通信，进程可能将数据写入已被其他进程轮转的旧文件句柄，
 	// 因此不能要求当前日志文件非空，数据在备份文件中也是正常的。
 	totalLines := countLinesInFile(path)
 	for _, m := range matches {

@@ -6,7 +6,7 @@
 **多进程安全的文件轮转库**，统一的 `Writer` 结构支持两种模式：
 
 - **标准模式** (`New()`) – 自动发现所有写入进程，通过 Leader 选举与可插拔的进程间通知机制实现精确协调。
-- **单机模式** (`NewLocal()`) – 无 IPC，每个进程通过内置 polling goroutine 独立检查文件状态，通过分布式锁协调轮转。
+- **单机模式** (`NewLocal()`) – 无进程间通信，每个进程通过内置 polling goroutine 独立检查文件状态，通过分布式锁协调轮转。
 
 ## 特性
 
@@ -35,8 +35,8 @@
 
 | 模式 | Linux | macOS | Windows | 说明 |
 |------|-------|-------|---------|------|
-| **标准模式** (`New()`) | ✅ | ✅ | ✅ | 默认 Unix Socket / Windows 命名管道 |
-| **单机模式** (`NewLocal()`) | ✅ | ✅ | ✅ | 仅依赖跨平台文件锁，无平台特定代码 |
+| **单机模式** (`NewLocal()`) | ✅ | ✅ | ✅ | 默认，基于文件轮询 + 文件锁，无 Leader 选举 |
+| **标准模式** (自定义通知器) | ✅ | ✅ | ✅ | 设置 NotifierFactory 后启用 Leader 选举 + 跨进程通知 |
 
 ## 快速开始
 
@@ -46,37 +46,17 @@
 go get github.com/piyongcai-liucai/filerotate
 ```
 
-### 标准模式（Leader 选举 + 本地 IPC）
+### 单机模式（默认，无进程间通信）
 
 ```go
+// 方式一：New() 自动选择（NotifierFactory 为 nil → 单机模式）
 writer, err := filerotate.New(filerotate.Config{
-    FilePath:      "./app.log",
-    MaxSizeMB:     10,
-    MaxAgeDays:    7,
-    CheckInterval: 5 * time.Second,
-    ErrorHandler:  func(err error) { log.Printf("filerotate: %v", err) },
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer writer.Close()
-
-// 直接用作 log.Logger 的输出
-log.SetOutput(writer)
-```
-
-### 单机模式（无 IPC，内置轮询 + 分布式锁）
-
-```go
-// 方式一：NewLocal 便捷函数（强制本地模式，忽略 LockerFactory/NotifierFactory）
-writer, err := filerotate.NewLocal(filerotate.Config{
     FilePath:   "./app.log",
-    MaxSizeMB:  100, // 文件总大小达到 100 MB 时触发轮转
+    MaxSizeMB:  100,
     MaxAgeDays: 7,
-    ErrorHandler: func(err error) { log.Printf("filerotate: %v", err) },
 })
-// 方式二：New() 自动检测（NotifierFactory 为 nil → 单机模式）
-writer, err := filerotate.New(filerotate.Config{
+// 方式二：NewLocal 便捷函数（强制单机模式，忽略 LockerFactory/NotifierFactory）
+writer, err := filerotate.NewLocal(filerotate.Config{
     FilePath:   "./app.log",
     MaxSizeMB:  100,
     MaxAgeDays: 7,
@@ -186,7 +166,6 @@ filerotate/
 │       ├── jetstream.go     # JetStream 临时消费者通知器
 │       └── valkey.go        # Valkey Pub/Sub 通知器
 └── example/
-    ├── basic/               # 标准模式多进程示例（本地 IPC）
     ├── local/               # 单机模式多进程示例
     ├── nats/                # NATS 通知器示例
     ├── jetstream/           # JetStream 通知器示例
