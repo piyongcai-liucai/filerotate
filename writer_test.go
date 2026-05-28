@@ -610,7 +610,7 @@ func TestNew_CustomLockerFactorySuccess(t *testing.T) {
 		FilePath:      path,
 		MaxSizeMB:     10,
 		ErrorHandler:  silentErrors,
-		LockerFactory: NewLocalLocker,
+		LockerFactory: newLocalLocker,
 		NotifierFactory: func(errorHandler func(error)) (Notifier, error) {
 			return &errorNotifier{}, nil
 		},

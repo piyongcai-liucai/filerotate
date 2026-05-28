@@ -54,7 +54,7 @@ func newLocal(cfg Config) (*Writer, error) {
 		return nil, err
 	}
 
-	w.rotateLocker, err = NewLocalLocker(w.lockPath)
+	w.rotateLocker, err = newLocalLocker(w.lockPath)
 	if err != nil {
 		w.file.Close()
 		return nil, fmt.Errorf("create rotate locker: %w", err)

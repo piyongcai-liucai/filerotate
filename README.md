@@ -3,10 +3,12 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/piyongcai-liucai/filerotate.svg)](https://pkg.go.dev/github.com/piyongcai-liucai/filerotate)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**多进程安全的文件轮转库**，统一的 `Writer` 结构支持两种模式：
+**多进程安全的文件轮转库**，提供统一的 `Writer` 结构和两种工作模式：
 
-- **标准模式** (`New()`) – 自动发现所有写入进程，通过 Leader 选举与可插拔的进程间通知机制实现精确协调。
-- **单机模式** (`NewLocal()`) – 无进程间通信，每个进程通过内置 polling goroutine 独立检查文件状态，通过分布式锁协调轮转。
+- `New()` – 根据 `NotifierFactory` 自动选择模式：
+  - `NotifierFactory` 为 nil（默认）→ **单机模式**，内置文件轮询 + 文件锁，开箱即用。
+  - `NotifierFactory` 非 nil → **标准模式**，通过 Leader 选举与可插拔的进程间通知机制实现精确协调。
+- `NewLocal()` – `New()` 的便捷封装，强制单机模式，忽略 `NotifierFactory`/`LockerFactory` 配置。
 
 ## 特性
 
@@ -107,7 +109,7 @@ type Config struct {
     MaxSizeMB       int                                             // 触发轮转的文件大小（MB），0 表示永不轮转
     MaxAgeDays      int                                             // 备份保留天数，0 为永久
     CheckInterval   time.Duration                                   // 检查间隔：默认 5s（标准），1s（单机）
-    LockerFactory   func(lockPath string) (Locker, error)           // 自定义锁工厂，默认文件锁
+    LockerFactory   func(lockPath string) (Locker, error)           // 自定义锁工厂，标准模式必填，单机模式忽略
     NotifierFactory func(errorHandler func(error)) (Notifier, error) // nil=单机模式，非nil=标准模式 + Leader选举
     ErrorHandler    func(error)                                     // 内部 goroutine 错误回调，默认打印 stderr
 }
@@ -119,7 +121,7 @@ type Config struct {
 
 | 实现 | 构造函数 | 适用场景 |
 |------|----------|----------|
-| 轮询 | 内置默认 | 基于文件轮询（inode + 大小检测），单机默认 |
+| 单机轮询 | 内置默认 | 基于文件轮询（inode + 大小检测），单机默认 |
 | NATS 核心 | `NewNATSNotifier(conn, subject, errorHandler)` | Pub/Sub，需要 NATS 服务 |
 | JetStream | `NewJetStreamNotifier(js, subject, errorHandler)` | 临时消费者，Stream 外部创建，消息持久化 |
 | Valkey | `NewValkeyNotifier(client, channel, errorHandler)` | Pub/Sub，需要 Valkey/Redis |
@@ -128,7 +130,7 @@ type Config struct {
 
 | 实现 | 构造函数 | 说明 |
 |------|----------|------|
-| 文件锁 | `NewLocalLocker(lockPath)` | 默认，基于 `gofrs/flock`，单机多进程 |
+| 单机文件锁 | 内置 | 默认，基于 `gofrs/flock`，单机模式自动使用 |
 | Valkey 锁 | `NewValkeyLocker(option, key)` | Redlock 算法，自动续期，适合跨主机 |
 
 > 如果你只在单台机器上运行多个进程，默认的文件锁就是最简单、最快速的方案。`Locker` 接口仅作为可选扩展提供。
@@ -137,11 +139,8 @@ type Config struct {
 
 | 场景 | 模式 | 通知器 | 锁 |
 |------|------|--------|-----|
-| 单机多进程 | 标准模式 | 内置轮询 | `NewLocalLocker` |
-| 单机，极简 | 单机模式 | 内置轮询 | `NewLocalLocker` |
-| 跨主机 NFS | 标准模式 | `NewValkeyNotifier` 或 `NewNATSNotifier` | `NewValkeyLocker` |
-| 已有 NATS | 标准模式 | `NewNATSNotifier` | `NewLocalLocker` |
-| 需要持久化通知 | 标准模式 | `NewJetStreamNotifier` | 任意 |
+| 单机极简模式 | 单机模式 | 内置单机轮询 | 内置单机文件锁 |
+| 网络文件系统 | 标准模式 | NATS / JetStream / Valkey | ValkeyLocker |
 
 ## 项目结构
 
@@ -177,7 +176,8 @@ filerotate/
 ### 标准模式
 
 ```
-进程启动 → 尝试获取 Leader 锁
+进程启动 → New()（NotifierFactory + LockerFactory 均非 nil）
+  → 尝试获取 Leader 锁
   ├── 成功 → runLeader()
   │          ├── 启动 Notifier.Serve()（监听连接）
   │          ├── Connect() 自己，接收自己广播的命令
@@ -191,7 +191,7 @@ filerotate/
 ### 单机模式
 
 ```
-进程启动 → NewLocal()
+进程启动 → New() / NewLocal()
   ├── 创建 LocalNotifier（polling goroutine，定期 stat 文件）
   ├── 启动 runLocalLoop goroutine 监听轮转信号
   └── Write() 热路径:
