@@ -1,145 +1,345 @@
-// Package notifier 提供本地 IPC 通知器的单元测试。
+// Package notifier 提供 LocalNotifier 的单元测试。
+// 测试覆盖构造、信号检测、去重、外部轮转检测和资源清理。
 package notifier
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
-// startLocalServer 启动一个本地通知器服务端，返回通知器实例和清理函数。
-// 通过 Connect 重试循环验证 Serve 已启动成功，避免固定 sleep 的竞态。
-func startLocalServer(t *testing.T, commPath string) (*LocalNotifier, func()) {
+// newMaxSize 创建一个 maxSize 辅助指针。
+func newMaxSize(n int64) *int64 { return &n }
+
+// tempFile 创建一个临时文件用于测试，返回文件路径和清理函数。
+func tempFile(t *testing.T) (string, func()) {
 	t.Helper()
-	n := NewLocalNotifier(commPath, discardErrors)
-	go n.Serve()
-
-	// 重试 Connect 直到成功或超时，确保 Serve 已就绪
-	var ch <-chan string
-	var err error
-	for i := 0; i < 20; i++ {
-		ch, err = n.Connect()
-		if err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	dir := "../../example/log"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
 	}
+	path := filepath.Join(dir, t.Name()+".log")
+	f, err := os.Create(path)
 	if err != nil {
-		t.Fatalf("Serve did not start within timeout: %v", err)
+		t.Fatalf("create temp file: %v", err)
 	}
+	f.Close()
+	return path, func() { os.Remove(path) }
+}
 
-	// 关闭验证连接，让真正的测试代码自行 Connect
-	go func() {
-		for range ch {
-		}
-	}()
 
-	return n, func() {
-		n.Close()
-		time.Sleep(50 * time.Millisecond)
+// testError 用于测试的错误类型。
+type testError struct{}
+
+func (e testError) Error() string { return "test error" }
+
+
+// ---------- 构造测试 ----------
+
+func TestNewLocal_FileNotExist(t *testing.T) {
+	_, err := NewLocal("/nonexistent/path/test.log", newMaxSize(1024), time.Second, discardErrors)
+	if err == nil {
+		t.Fatal("expected error for non-existent file")
 	}
 }
 
-// TestLocalNotifierServeAndConnect 验证服务端正常启动且客户端可成功连接。
-func TestLocalNotifierServeAndConnect(t *testing.T) {
-	testPipe := "filerotate_test_serve"
-	n, cleanup := startLocalServer(t, testPipe)
-	defer cleanup()
+func TestNewLocal_Success(t *testing.T) {
+	path, _ := tempFile(t)
+	n, err := NewLocal(path, newMaxSize(1024), 100*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	n.Close()
+}
+
+// ---------- Connect / Broadcast 测试 ----------
+
+func TestLocalNotifier_Connect(t *testing.T) {
+	path, _ := tempFile(t)
+	n, err := NewLocal(path, newMaxSize(1024), time.Second, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
 
 	ch, err := n.Connect()
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("Connect: %v", err)
 	}
 	if ch == nil {
 		t.Fatal("expected non-nil channel")
 	}
 }
 
-// TestLocalNotifierBroadcast 验证单客户端能够正确接收广播命令。
-func TestLocalNotifierBroadcast(t *testing.T) {
-	testPipe := "filerotate_test_broadcast"
-	n, cleanup := startLocalServer(t, testPipe)
-	defer cleanup()
-
-	ch, err := n.Connect()
+func TestLocalNotifier_Broadcast(t *testing.T) {
+	path, _ := tempFile(t)
+	n, err := NewLocal(path, newMaxSize(1024), time.Second, discardErrors)
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	ch, _ := n.Connect()
+	if err := n.Broadcast("HELLO"); err != nil {
+		t.Fatalf("Broadcast: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-	if err := n.Broadcast(cmdRotate); err != nil {
-		t.Fatalf("broadcast: %v", err)
+	select {
+	case cmd := <-ch:
+		if cmd != "HELLO" {
+			t.Fatalf("expected %q, got %q", "HELLO", cmd)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for broadcast")
 	}
+}
+
+// ---------- 轮询信号测试 ----------
+
+func TestLocalNotifier_SizeExceedsThreshold(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(10)
+	n, err := NewLocal(path, &maxSize, 50*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	ch, _ := n.Connect()
+	n.Serve()
+
+	// 写入超过阈值的数据
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open file: %v", err)
+	}
+	f.Write(make([]byte, 20))
+	f.Close()
 
 	assertChannelReceived(t, ch, cmdRotate, 2*time.Second)
 }
 
-// TestLocalNotifierMultipleClients 验证广播时所有已连接客户端都能收到命令。
-func TestLocalNotifierMultipleClients(t *testing.T) {
-	testPipe := "filerotate_test_multi"
-	n, cleanup := startLocalServer(t, testPipe)
-	defer cleanup()
+func TestLocalNotifier_SignalSentPreventsDuplicate(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(10)
+	n, err := NewLocal(path, &maxSize, 50*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
 
-	var channels []<-chan string
-	for i := 0; i < 3; i++ {
-		ch, err := n.Connect()
-		if err != nil {
-			t.Fatalf("connect %d: %v", i, err)
-		}
-		channels = append(channels, ch)
+	ch, _ := n.Connect()
+	n.Serve()
+
+	// 写入数据触发信号
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.Write(make([]byte, 20))
+	f.Close()
+
+	// 应收到第一个 ROTATE
+	assertChannelReceived(t, ch, cmdRotate, 2*time.Second)
+
+	// 在 Reset 前，不应再收到第二个（去重）
+	select {
+	case cmd := <-ch:
+		t.Fatalf("unexpected duplicate signal: %q", cmd)
+	case <-time.After(300 * time.Millisecond):
+		// 预期超时，无重复信号
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	if err := n.Broadcast(cmdRotate); err != nil {
-		t.Fatalf("broadcast: %v", err)
-	}
+	// Reset 后，继续写入应触发新信号
+	n.Reset()
+	f, _ = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.Write(make([]byte, 30))
+	f.Close()
+	assertChannelReceived(t, ch, cmdRotate, 2*time.Second)
+}
 
-	for _, ch := range channels {
-		assertChannelReceived(t, ch, cmdRotate, 2*time.Second)
+func TestLocalNotifier_MaxSizeZero_NoSignalBySize(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(0) // 永不以大小触发
+	n, err := NewLocal(path, &maxSize, 50*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	ch, _ := n.Connect()
+	n.Serve()
+
+	// 写入大量数据
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.Write(make([]byte, 1024))
+	f.Close()
+
+	// 不应收到 ROTATE
+	select {
+	case cmd := <-ch:
+		t.Fatalf("unexpected signal with maxSize=0: %q", cmd)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
-// TestLocalNotifierClose 验证关闭通知器后资源被释放。
-func TestLocalNotifierClose(t *testing.T) {
-	testPipe := "filerotate_test_close"
-	n := NewLocalNotifier(testPipe, discardErrors)
-
-	go n.Serve()
-
-	// 通过 Connect 重试验证 Serve 已启动
-	var err error
-	for i := 0; i < 20; i++ {
-		_, err = n.Connect()
-		if err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+func TestLocalNotifier_SameFileTriggersRotate(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(10)
+	n, err := NewLocal(path, &maxSize, 50*time.Millisecond, discardErrors)
 	if err != nil {
-		t.Fatalf("Serve did not start: %v", err)
+		t.Fatalf("NewLocal: %v", err)
 	}
+	defer n.Close()
+
+	ch, _ := n.Connect()
+	n.Serve()
+	time.Sleep(100 * time.Millisecond) // 等待首个 tick 完成
+
+	// 模拟外部轮转：rename 旧文件 + 创建新文件
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	f.Close()
+
+	// inode 变化应触发 ROTATE
+	assertChannelReceived(t, ch, cmdRotate, 2*time.Second)
+}
+
+func TestLocalNotifier_SameFileNoSignal(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(1024 * 1024) // 1MB，远超测试数据
+	n, err := NewLocal(path, &maxSize, 50*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	ch, _ := n.Connect()
+	n.Serve()
+
+	// 写入少量数据，不超阈值
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.Write(make([]byte, 100))
+	f.Close()
+
+	// 不应收到信号（未超阈值，未改变 inode）
+	select {
+	case cmd := <-ch:
+		t.Fatalf("unexpected signal: %q", cmd)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// ---------- Close 测试 ----------
+
+func TestLocalNotifier_Close_StopsPolling(t *testing.T) {
+	path, _ := tempFile(t)
+	n, err := NewLocal(path, newMaxSize(1024), 50*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+
+	ch, _ := n.Connect()
+	n.Serve()
 
 	if err := n.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+		t.Fatalf("Close: %v", err)
+	}
+
+	// channel 应被关闭
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("channel should be closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("channel should be closed")
 	}
 }
 
-// TestLocalNotifierConnectToClosedServer 验证连接到未启动的服务端时应返回错误。
-func TestLocalNotifierConnectToClosedServer(t *testing.T) {
-	testPipe := "filerotate_test_closed"
-	n := NewLocalNotifier(testPipe, discardErrors)
+// ---------- Reset 测试 ----------
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := n.Connect()
-		done <- err
-	}()
+func TestLocalNotifier_Reset_BeforeServe(t *testing.T) {
+	path, _ := tempFile(t)
+	n, err := NewLocal(path, newMaxSize(1024), time.Second, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
 
+	// Reset 在未 Serve 时不应 panic
+	n.Reset()
+}
+
+// ---------- reportError + nil errorHandler 测试 ----------
+
+func TestLocalNotifier_NilErrorHandler(t *testing.T) {
+	path, _ := tempFile(t)
+	// 传入 nil errorHandler，不应 panic
+	n, err := NewLocal(path, newMaxSize(1024), time.Second, nil)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	// reportError 在 nil handler 时应安全返回
+	n.reportError(nil)
+	n.reportError(testError{})
+}
+
+func TestLocalNotifier_CheckAndSignal_StatError(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(10)
+	n, err := NewLocal(path, &maxSize, 50*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	// 删除文件后 checkAndSignal 应处理 Stat 错误
+	os.Remove(path)
+	n.checkAndSignal() // 不应 panic
+}
+
+// ---------- UpdateFileInfo 测试 ----------
+
+func TestLocalNotifier_UpdateFileInfo_PreventsSpuriousRotate(t *testing.T) {
+	path, _ := tempFile(t)
+	maxSize := int64(100) // 不会因大小触发
+	n, err := NewLocal(path, &maxSize, 500*time.Millisecond, discardErrors)
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	defer n.Close()
+
+	ch, _ := n.Connect()
+	n.Serve()
+	time.Sleep(100 * time.Millisecond) // 等待首个 tick 完成
+
+	// 模拟自身轮转：rename + 创建新文件
+	// signalSent=false，如果在 rename 后 poll 触发会检测到 inode 变化。
+	// 使用长 poll 间隔确保我们能在下次 tick 前完成 UpdateFileInfo + Reset。
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	f, _ := os.Create(path)
+	f.Close()
+
+	// 模拟 runLocalLoop 轮转后同步文件信息
+	if newFi, err := os.Stat(path); err == nil {
+		n.UpdateFileInfo(newFi)
+	}
+	// 清空可能已发送的信号（竞态窗口内的 ROTATE）
+	n.Reset()
+	drainChannel(ch)
+
+	// 不应再收到信号
 	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("expected error connecting to non-existent server")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout connecting to closed server")
+	case cmd := <-ch:
+		t.Fatalf("unexpected signal after UpdateFileInfo: %q", cmd)
+	case <-time.After(600 * time.Millisecond):
 	}
 }

@@ -6,7 +6,7 @@
 **多进程安全的文件轮转库**，统一的 `Writer` 结构支持两种模式：
 
 - **标准模式** (`New()`) – 自动发现所有写入进程，通过 Leader 选举与可插拔的进程间通知机制实现精确协调。
-- **Lite 模式** (`NewLite()`) – 无 IPC，每个进程通过内置 polling goroutine 独立检查文件状态，通过分布式锁协调轮转。
+- **单机模式** (`NewLocal()`) – 无 IPC，每个进程通过内置 polling goroutine 独立检查文件状态，通过分布式锁协调轮转。
 
 ## 特性
 
@@ -25,7 +25,7 @@
 - **Leader 死亡自动恢复** – 原 Leader 崩溃后其他进程自动重新选举。
 - **可插拔通知与锁** – 提供 `Notifier` 和 `Locker` 接口，内置多种实现。
 
-### Lite 模式特点
+### 单机模式特点
 
 - **无进程间通信** – 每个进程通过内置 polling goroutine 独立检测文件大小和 inode 变化。
 - **统一阈值** – 所有进程共享同一 `MaxSizeMB` 阈值，无需预估每进程写入量。
@@ -36,7 +36,7 @@
 | 模式 | Linux | macOS | Windows | 说明 |
 |------|-------|-------|---------|------|
 | **标准模式** (`New()`) | ✅ | ✅ | ✅ | 默认 Unix Socket / Windows 命名管道 |
-| **Lite 模式** (`NewLite()`) | ✅ | ✅ | ✅ | 仅依赖跨平台文件锁，无平台特定代码 |
+| **单机模式** (`NewLocal()`) | ✅ | ✅ | ✅ | 仅依赖跨平台文件锁，无平台特定代码 |
 
 ## 快速开始
 
@@ -65,15 +65,21 @@ defer writer.Close()
 log.SetOutput(writer)
 ```
 
-### Lite 模式（无 IPC，内置轮询 + 分布式锁）
+### 单机模式（无 IPC，内置轮询 + 分布式锁）
 
 ```go
-writer, err := filerotate.NewLite(filerotate.LiteConfig{
-    FilePath:     "./app.log",
-    MaxSizeMB:    100, // 文件总大小达到 100 MB 时触发轮转
-    MaxAgeDays:   7,
-    PollInterval: 1 * time.Second,
+// 方式一：NewLocal 便捷函数（强制本地模式，忽略 LockerFactory/NotifierFactory）
+writer, err := filerotate.NewLocal(filerotate.Config{
+    FilePath:   "./app.log",
+    MaxSizeMB:  100, // 文件总大小达到 100 MB 时触发轮转
+    MaxAgeDays: 7,
     ErrorHandler: func(err error) { log.Printf("filerotate: %v", err) },
+})
+// 方式二：New() 自动检测（NotifierFactory 为 nil → 单机模式）
+writer, err := filerotate.New(filerotate.Config{
+    FilePath:   "./app.log",
+    MaxSizeMB:  100,
+    MaxAgeDays: 7,
 })
 if err != nil {
     log.Fatal(err)
@@ -105,7 +111,7 @@ writer, _ := filerotate.New(filerotate.Config{
     LockerFactory: func(lockPath string) (filerotate.Locker, error) {
         return locker, nil
     },
-    NotifierFactory: func(commPath string, errorHandler func(error)) (filerotate.Notifier, error) {
+    NotifierFactory: func(errorHandler func(error)) (filerotate.Notifier, error) {
         return filerotate.NewValkeyNotifier(client, "filerotate:rotate", errorHandler), nil
     },
 })
@@ -113,29 +119,17 @@ writer, _ := filerotate.New(filerotate.Config{
 
 ## 配置说明
 
-### 标准模式 Config
+### NotifierFactory 与模式选择
 
 ```go
 type Config struct {
     FilePath        string                                          // 文件路径，所有进程必须相同
     MaxSizeMB       int                                             // 触发轮转的文件大小（MB），0 表示永不轮转
     MaxAgeDays      int                                             // 备份保留天数，0 为永久
-    CheckInterval   time.Duration                                   // Leader 检查文件大小的间隔，默认 5s
+    CheckInterval   time.Duration                                   // 检查间隔：默认 5s（标准），1s（单机）
     LockerFactory   func(lockPath string) (Locker, error)           // 自定义锁工厂，默认文件锁
-    NotifierFactory func(commPath string, errorHandler func(error)) (Notifier, error) // 自定义通知器工厂，默认本地 IPC
+    NotifierFactory func(errorHandler func(error)) (Notifier, error) // nil=单机模式，非nil=标准模式 + Leader选举
     ErrorHandler    func(error)                                     // 内部 goroutine 错误回调，默认打印 stderr
-}
-```
-
-### Lite 模式 LiteConfig
-
-```go
-type LiteConfig struct {
-    FilePath     string        // 文件路径，所有进程必须相同
-    MaxSizeMB    int           // 触发轮转的文件总大小（MB），0 表示永不轮转
-    MaxAgeDays   int           // 备份保留天数，0 为永久
-    PollInterval time.Duration // 轮询文件状态的间隔，默认 1s
-    ErrorHandler func(error)   // 内部 goroutine 错误回调，默认打印 stderr
 }
 ```
 
@@ -145,16 +139,16 @@ type LiteConfig struct {
 
 | 实现 | 构造函数 | 适用场景 |
 |------|----------|----------|
-| 本地 IPC | `NewLocalNotifier(commPath, errorHandler)` | 默认，Unix Socket / Windows 命名管道 |
+| 轮询 | 内置默认 | 基于文件轮询（inode + 大小检测），单机默认 |
 | NATS 核心 | `NewNATSNotifier(conn, subject, errorHandler)` | Pub/Sub，需要 NATS 服务 |
-| JetStream | `NewJetStreamNotifier(js, subject, streamName, errorHandler)` | 临时消费者，Stream 外部创建，消息持久化 |
+| JetStream | `NewJetStreamNotifier(js, subject, errorHandler)` | 临时消费者，Stream 外部创建，消息持久化 |
 | Valkey | `NewValkeyNotifier(client, channel, errorHandler)` | Pub/Sub，需要 Valkey/Redis |
 
 ### 分布式锁（Locker）
 
 | 实现 | 构造函数 | 说明 |
 |------|----------|------|
-| 文件锁 | `NewFileLocker(lockPath)` | 默认，基于 `gofrs/flock`，单机多进程 |
+| 文件锁 | `NewLocalLocker(lockPath)` | 默认，基于 `gofrs/flock`，单机多进程 |
 | Valkey 锁 | `NewValkeyLocker(option, key)` | Redlock 算法，自动续期，适合跨主机 |
 
 > 如果你只在单台机器上运行多个进程，默认的文件锁就是最简单、最快速的方案。`Locker` 接口仅作为可选扩展提供。
@@ -163,10 +157,10 @@ type LiteConfig struct {
 
 | 场景 | 模式 | 通知器 | 锁 |
 |------|------|--------|-----|
-| 单机多进程 | 标准模式 | `NewLocalNotifier` | `NewFileLocker` |
-| 单机，极简 | Lite 模式 | 内置轮询 | `NewFileLocker` |
+| 单机多进程 | 标准模式 | 内置轮询 | `NewLocalLocker` |
+| 单机，极简 | 单机模式 | 内置轮询 | `NewLocalLocker` |
 | 跨主机 NFS | 标准模式 | `NewValkeyNotifier` 或 `NewNATSNotifier` | `NewValkeyLocker` |
-| 已有 NATS | 标准模式 | `NewNATSNotifier` | `NewFileLocker` |
+| 已有 NATS | 标准模式 | `NewNATSNotifier` | `NewLocalLocker` |
 | 需要持久化通知 | 标准模式 | `NewJetStreamNotifier` | 任意 |
 
 ## 项目结构
@@ -174,7 +168,7 @@ type LiteConfig struct {
 ```
 filerotate/
 ├── writer.go                # Writer 结构 + 标准模式 Config/New
-├── writer_lite.go           # Lite 模式 LiteConfig/NewLite
+├── writer_local.go           # 单机模式便捷构造函数和自轮转循环
 ├── leader.go                # Leader 选举、文件监控、轮转触发
 ├── rotate.go                # 文件重命名、备份清理、时间戳解析
 ├── open_file_unix.go        # Unix: O_CREATE|O_APPEND|O_WRONLY
@@ -184,18 +178,16 @@ filerotate/
 ├── integration_test.go      # 多进程集成测试
 ├── internal/
 │   ├── locker/
-│   │   ├── file.go          # 文件锁（flock）
+│   │   ├── local.go         # 单机文件锁（flock）
 │   │   └── valkey.go        # Valkey 锁（Redlock）
 │   └── notifier/
-│       ├── default.go       # 轮询通知器（Lite 模式内置）
-│       ├── local_unix.go    # Unix Socket 通知器
-│       ├── local_windows.go # Windows 命名管道通知器
+│       ├── local.go         # 单机轮询通知器（基于文件大小和 inode）
 │       ├── nats.go          # NATS Pub/Sub 通知器
 │       ├── jetstream.go     # JetStream 临时消费者通知器
 │       └── valkey.go        # Valkey Pub/Sub 通知器
 └── example/
     ├── basic/               # 标准模式多进程示例（本地 IPC）
-    ├── lite/                # Lite 模式多进程示例
+    ├── local/               # 单机模式多进程示例
     ├── nats/                # NATS 通知器示例
     ├── jetstream/           # JetStream 通知器示例
     └── valkey/              # Valkey 通知器 + 锁示例
@@ -217,19 +209,22 @@ filerotate/
              └── 收到 ROTATE → 发送信号到 rotateCh → Write() 中 reopenFile()
 ```
 
-### Lite 模式
+### 单机模式
 
 ```
-进程启动 → NewLite()
-  ├── 创建 DefaultNotifier（polling goroutine，定期 stat 文件）
-  ├── 启动 handleCommands goroutine 监听轮转信号
+进程启动 → NewLocal()
+  ├── 创建 LocalNotifier（polling goroutine，定期 stat 文件）
+  ├── 启动 runLocalLoop goroutine 监听轮转信号
   └── Write() 热路径:
        ├── select rotateCh（非阻塞检查）
-       │   └── 有信号 → rotateIfNeededLite()
-       │       ├── TryLock()（非阻塞抢锁）
-       │       ├── 抢到锁 → 二次确认文件大小 → doRotationLite()
-       │       └── 没抢到 → reopenFile()（别人已轮转，切到新文件）
+       │   └── 有信号 → reopenFile()
        └── f.Write(p)（直接写入，无锁）
+
+LocalNotifier 检测到 size 超阈值或 inode 变化 → 发送 ROTATE
+  → runLocalLoop 收到 ROTATE → tryRotate()
+      ├── TryLock()（非阻塞抢锁）
+      ├── 抢到锁 → 二次确认文件大小 → doRotation()
+      └── 没抢到（别人已轮转）→ 仅 reopenFile()
 ```
 
 ## 轮转文件命名

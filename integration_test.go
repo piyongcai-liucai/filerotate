@@ -46,10 +46,10 @@ func runChildProcess() {
 		err = childWriterFailoverLeader(filePath)
 	case "writer_failover_follower":
 		err = childWriterFailoverFollower(filePath)
-	case "lite_basic":
-		err = childLiteBasic(filePath)
-	case "lite_rotate":
-		err = childLiteRotate(filePath)
+	case "local_basic":
+		err = childLocalBasic(filePath)
+	case "local_rotate":
+		err = childLocalRotate(filePath)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown child role: %s", role)
 		os.Exit(1)
@@ -248,9 +248,9 @@ func childWriterFailoverFollower(filePath string) error {
 	return nil
 }
 
-// childLiteBasic 创建 Lite 模式 Writer，写入 100 行后退出。
-func childLiteBasic(filePath string) error {
-	w, err := NewLite(LiteConfig{
+// childLocalBasic 创建单机模式 Writer，写入 100 行后退出。
+func childLocalBasic(filePath string) error {
+	w, err := New(Config{
 		FilePath:   filePath,
 		MaxSizeMB:  100,
 		MaxAgeDays: 0,
@@ -269,13 +269,13 @@ func childLiteBasic(filePath string) error {
 	return nil
 }
 
-// childLiteRotate 创建 Lite 模式 Writer（小 maxSize），写入触发轮转。
-func childLiteRotate(filePath string) error {
-	w, err := NewLite(LiteConfig{
-		FilePath:     filePath,
-		MaxSizeMB:    0,
-		MaxAgeDays:   0,
-		PollInterval: 100 * time.Millisecond,
+// childLocalRotate 创建单机模式 Writer（小 maxSize），写入触发轮转。
+func childLocalRotate(filePath string) error {
+	w, err := New(Config{
+		FilePath:      filePath,
+		MaxSizeMB:     0,
+		MaxAgeDays:    0,
+		CheckInterval: 100 * time.Millisecond,
 	})
 	if err != nil {
 		return err
@@ -412,18 +412,18 @@ func TestMultiProcWriterFailover(t *testing.T) {
 	}
 }
 
-// ========== LiteWriter 多进程测试 ==========
+// ========== LocalWriter 多进程测试 ==========
 
-// TestMultiProcLiteWriterBasic 验证 2 个进程通过 LiteWriter 并发写入，无数据丢失。
-func TestMultiProcLiteWriterBasic(t *testing.T) {
+// TestMultiProcLocalWriterBasic 验证 2 个进程通过 LocalWriter 并发写入，无数据丢失。
+func TestMultiProcLocalWriterBasic(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过集成测试 (short 模式)")
 	}
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestMultiProcLiteWriterBasic.log")
+	path := filepath.Join(logDir, "TestMultiProcLocalWriterBasic.log")
 	defer cleanupIntegration(t, path)
 
-	runTwoChildren(t, "lite_basic", path, 30*time.Second)
+	runTwoChildren(t, "local_basic", path, 30*time.Second)
 
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -435,16 +435,16 @@ func TestMultiProcLiteWriterBasic(t *testing.T) {
 	}
 }
 
-// TestMultiProcLiteWriterRotation 验证多进程 LiteWriter 各自触发轮转，分布式锁防冲突。
-func TestMultiProcLiteWriterRotation(t *testing.T) {
+// TestMultiProcLocalWriterRotation 验证多进程 LocalWriter 各自触发轮转，分布式锁防冲突。
+func TestMultiProcLocalWriterRotation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过集成测试 (short 模式)")
 	}
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestMultiProcLiteWriterRotation.log")
+	path := filepath.Join(logDir, "TestMultiProcLocalWriterRotation.log")
 	defer cleanupIntegration(t, path)
 
-	runTwoChildren(t, "lite_rotate", path, 60*time.Second)
+	runTwoChildren(t, "local_rotate", path, 60*time.Second)
 
 	base := filepath.Base(path)
 	matches, _ := filepath.Glob(path + ".*")
@@ -460,7 +460,7 @@ func TestMultiProcLiteWriterRotation(t *testing.T) {
 	t.Logf("找到 %d 个备份文件", backupCount)
 
 	// 统计所有文件（当前文件 + 备份文件）中的总行数，验证数据不丢失。
-	// LiteWriter 无 IPC，进程可能将数据写入已被其他进程轮转的旧文件句柄，
+	// LocalWriter 无 IPC，进程可能将数据写入已被其他进程轮转的旧文件句柄，
 	// 因此不能要求当前日志文件非空，数据在备份文件中也是正常的。
 	totalLines := countLinesInFile(path)
 	for _, m := range matches {

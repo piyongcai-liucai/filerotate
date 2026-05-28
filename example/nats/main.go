@@ -71,7 +71,7 @@ func runNATSProcess(id int, done <-chan struct{}) {
 		MaxSizeMB:     maxSizeMB,
 		MaxAgeDays:    7,
 		CheckInterval: time.Second,
-		NotifierFactory: func(commPath string, errorHandler func(error)) (filerotate.Notifier, error) {
+		NotifierFactory: func(errorHandler func(error)) (filerotate.Notifier, error) {
 			return filerotate.NewNATSNotifier(nc, "filerotate.rotate", errorHandler), nil
 		},
 	})

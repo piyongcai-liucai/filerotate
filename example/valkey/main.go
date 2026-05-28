@@ -85,7 +85,7 @@ func runValkeyProcess(id int, done <-chan struct{}) {
 				lockPath,
 			)
 		},
-		NotifierFactory: func(commPath string, errorHandler func(error)) (filerotate.Notifier, error) {
+		NotifierFactory: func(errorHandler func(error)) (filerotate.Notifier, error) {
 			return filerotate.NewValkeyNotifier(client, "filerotate.rotate", errorHandler), nil
 		},
 	})

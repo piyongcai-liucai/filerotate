@@ -4,7 +4,6 @@
 package filerotate
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -34,9 +33,9 @@ type Config struct {
 	// 若工厂返回错误，Writer 创建将失败。
 	LockerFactory func(lockPath string) (Locker, error)
 
-	// NotifierFactory 自定义通知器工厂函数。
-	// 若为 nil，使用平台默认本地 IPC（Unix Socket 或 Windows 命名管道）。
-	NotifierFactory func(commPath string, errorHandler func(error)) (Notifier, error)
+	// NotifierFactory 自定义通知器工厂函数。若为 nil，使用基于文件轮询的默认通知器。
+	// 跨主机场景（NFS + IPC）时可注入 NATS / JetStream / Valkey 等通知器。
+	NotifierFactory func(errorHandler func(error)) (Notifier, error)
 
 	// ErrorHandler 当内部 goroutine 发生错误时调用。如果为 nil，错误将打印到 stderr。
 	ErrorHandler func(error)
@@ -47,12 +46,12 @@ type Config struct {
 // 标准模式：通过 Leader 选举和进程间通知协调所有进程。
 // 所有进程平等竞争 Leader，Leader 负责监控文件大小并广播轮转命令。
 //
-// Lite 模式：无 Leader 选举，无进程间 IPC。每个进程通过内置的
+// 单机（Local）模式：无 Leader 选举，无进程间 IPC。每个进程通过内置的
 // polling goroutine 独立检查文件状态，通过分布式锁协调轮转操作。
 //
 // Writer 实现了 io.WriteCloser，可直接与 log.Logger、fmt.Fprint 等配合使用。
 type Writer struct {
-	mu             sync.Mutex    // 保护并发写入和内部状态（标准模式）
+	mu             sync.Mutex    // 保护 doRotation 文件替换和 Close，两种模式共用
 	file           *os.File      // 当前文件句柄，使用 O_APPEND 模式保证多进程安全写入
 	filePath       string        // 文件路径，所有进程必须相同
 	lockPath       string        // 轮转锁文件路径
@@ -65,8 +64,8 @@ type Writer struct {
 	rotateCh       chan struct{} // 接收轮转通知的通道，收到信号后重开文件
 	errorHandler   func(error)   // 错误处理回调，用于异步报告内部错误
 
-	lite         bool   // 是否为 Lite 模式（无 Leader 选举，无 IPC）
-	rotateLocker Locker // Lite 模式轮转分布式锁，多进程协调
+	local        bool   // 是否为单机（Local）模式（无 Leader 选举，无 IPC）
+	rotateLocker Locker // 单机模式轮转分布式锁，多进程协调
 
 	lastLeaderFileInfo os.FileInfo // Leader 用于检测外部轮转（inode 变化），仅 ticker goroutine 访问
 
@@ -75,18 +74,33 @@ type Writer struct {
 	closeOnce sync.Once      // 确保 Close 只执行一次
 }
 
-// New 创建一个标准版 Writer，自动加入协调组。
+// New 创建一个 Writer。
+//
+// 根据 NotifierFactory 自动选择模式：
+//   - NotifierFactory == nil：单机模式，使用内置 LocalNotifier 轮询 + 分布式锁协调多进程。
+//     所有进程平等，无 Leader 选举。
+//   - NotifierFactory != nil：标准模式，使用自定义 IPC 通知器 + Leader 选举协调多进程。
 func New(cfg Config) (*Writer, error) {
-	if cfg.CheckInterval == 0 {
-		cfg.CheckInterval = 5 * time.Second
-	}
-	if cfg.LockerFactory == nil {
-		cfg.LockerFactory = NewFileLocker
-	}
 	if cfg.ErrorHandler == nil {
 		cfg.ErrorHandler = func(err error) {
 			fmt.Fprintf(os.Stderr, "filerotate: %v\n", err)
 		}
+	}
+
+	if cfg.NotifierFactory == nil {
+		return newLocal(cfg)
+	}
+	if cfg.LockerFactory == nil {
+		return nil, errors.New("标准模式必须设置 LockerFactory，跨主机请使用 NewValkeyLocker")
+	}
+	return newStandard(cfg)
+}
+
+
+// newStandard 创建标准模式 Writer（IPC 通知 + Leader 选举）。
+func newStandard(cfg Config) (*Writer, error) {
+	if cfg.CheckInterval == 0 {
+		cfg.CheckInterval = 5 * time.Second
 	}
 
 	w := &Writer{
@@ -101,43 +115,45 @@ func New(cfg Config) (*Writer, error) {
 		done:           make(chan struct{}),
 	}
 
-	// 确保日志文件和锁文件的目录存在
 	if err := os.MkdirAll(filepath.Dir(cfg.FilePath), 0o755); err != nil {
 		return nil, fmt.Errorf("create directory: %w", err)
 	}
 
-	// 打开日志文件
 	var err error
 	w.file, err = openFileAppend(w.filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	// 创建 Leader 选举锁
 	w.leaderLocker, err = cfg.LockerFactory(w.leaderLockPath)
 	if err != nil {
 		w.file.Close()
 		return nil, fmt.Errorf("create leader locker: %w", err)
 	}
 
-	// 使用文件路径的哈希值生成唯一的命名管道名称（Windows）或 Socket 文件名（Unix）
-	// 确保同一日志文件的所有进程使用相同的通信标识，不同日志文件使用不同的标识
-	hash := sha256.Sum256([]byte(w.filePath))
-	commPath := fmt.Sprintf("filerotate_%x", hash[:8])
-
-	// 创建通知器
-	if cfg.NotifierFactory != nil {
-		w.notifier, err = cfg.NotifierFactory(commPath, cfg.ErrorHandler)
-	} else {
-		w.notifier = NewLocalNotifier(commPath, cfg.ErrorHandler)
-	}
+	w.rotateLocker, err = cfg.LockerFactory(w.lockPath)
 	if err != nil {
 		w.file.Close()
 		w.leaderLocker.Unlock()
-		return nil, fmt.Errorf("create notifier: %w", err)
+		return nil, fmt.Errorf("create rotate locker: %w", err)
 	}
 
-	// 尝试成为 Leader，否则作为客户端连接现有 Leader
+	var notifierErr error
+	w.notifier, notifierErr = cfg.NotifierFactory(cfg.ErrorHandler)
+	if notifierErr != nil {
+		w.file.Close()
+		w.leaderLocker.Unlock()
+		w.rotateLocker.Unlock()
+		return nil, fmt.Errorf("create notifier: %w", notifierErr)
+	}
+
+	if err := w.notifier.Serve(); err != nil {
+		w.file.Close()
+		w.leaderLocker.Unlock()
+		w.rotateLocker.Unlock()
+		return nil, fmt.Errorf("serve notifier: %w", err)
+	}
+
 	if w.tryBecomeLeader() {
 		w.wg.Add(1)
 		go w.runLeader()
@@ -149,20 +165,19 @@ func New(cfg Config) (*Writer, error) {
 }
 
 // Write 实现 io.Writer。写入前检查是否有轮转信号，若有则先处理轮转。
-// Write 本身不加锁，仅在轮转操作中加锁（标准模式用 mu，Lite 模式用分布式锁）。
+// Write 本身不加锁，仅在轮转操作中加锁（标准模式用 mu，单机模式用分布式锁）。
 // 若本轮写入期间发生轮转，数据进入备份文件而非新文件，但数据不会丢失，
 // 下次写入时自动重开文件。
 func (w *Writer) Write(p []byte) (n int, err error) {
-	// 写入前检查轮转信号
+	// 写入前检查轮转信号：无论 Standard/Local，统一重开文件。
+	// 轮转由 Leader 在 ticker 中执行，Write() 只负责在新文件上继续写入。
 	select {
 	case <-w.rotateCh:
-		if w.lite {
-			w.rotateIfNeededLite()
+		if err := w.reopenFile(); err != nil {
+			w.reportError(err)
+			w.requeueRotate()
 		} else {
-			if err := w.reopenFile(); err != nil {
-				w.reportError(err)
-				w.requeueRotate()
-			}
+			w.resetNotifier()
 		}
 	default:
 	}
@@ -174,75 +189,9 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 	return f.Write(p)
 }
 
-// rotateIfNeededLite 尝试获取轮转锁，执行轮转或重开文件。
-// 仅在轮转成功或确认无需轮转时重置 notifier 状态；
-// 失败时将信号放回 rotateCh，下一次 Write() 继续尝试。
-func (w *Writer) rotateIfNeededLite() {
-	ok, lockErr := w.rotateLocker.TryLock()
-	if lockErr != nil {
-		w.reportError(lockErr)
-		w.requeueRotate()
-		return
-	}
-	if !ok {
-		// 其他进程正在轮转，重开文件即可
-		if err := w.reopenFile(); err != nil {
-			w.reportError(err)
-			w.requeueRotate()
-			return
-		}
-		w.resetNotifier()
-		return
-	}
-	defer w.rotateLocker.Unlock()
-
-	// 二次确认：通过 inode 比较检查文件是否已被其他进程轮转。
-	// os.SameFile 基于文件系统标识（inode/文件索引），不受文件大小影响：
-	// 即使新文件已被写入大量数据，只要 inode 不同就能正确判断已轮转。
-	myInfo, err := w.file.Stat()
-	if err != nil {
-		w.reportError(err)
-		w.requeueRotate()
-		return
-	}
-
-	diskInfo, err := os.Stat(w.filePath)
-	if err != nil {
-		// 文件可能被其他进程 rename 后新文件尚未创建（如磁盘满），
-		// 调用 reopenFile 尝试用 O_CREATE 重建
-		w.reportError(err)
-		if reopenErr := w.reopenFile(); reopenErr != nil {
-			w.reportError(reopenErr)
-			w.requeueRotate()
-			return
-		}
-		w.resetNotifier()
-		return
-	}
-
-	// 不同 inode → 文件已被其他进程替换，重开新文件即可
-	if !os.SameFile(myInfo, diskInfo) {
-		if err := w.reopenFile(); err != nil {
-			w.reportError(err)
-			w.requeueRotate()
-			return
-		}
-		w.resetNotifier()
-		return
-	}
-
-	// 同一文件 → 需要执行轮转
-	if err := w.doRotation(); err != nil {
-		w.reportError(err)
-		w.requeueRotate()
-		return
-	}
-	w.resetNotifier()
-}
-
 // resetNotifier 通知 notifier 本轮处理已完成，可继续检测。
 func (w *Writer) resetNotifier() {
-	if r, ok := w.notifier.(resetter); ok {
+	if r, ok := w.notifier.(interface{ Reset() }); ok {
 		r.Reset()
 	}
 }
@@ -265,13 +214,13 @@ func (w *Writer) Close() error {
 			w.notifier.Close()
 		}
 
-		if w.lite {
+		// 单机模式：LocalNotifier 的 Serve 在 Close 时能正常退出，Wait 安全。
+		// 标准模式：IPC notifier 的 Serve 可能仍在 Accept 上阻塞，不 Wait。
+		if w.local {
 			w.wg.Wait()
-			if w.rotateLocker != nil {
-				w.rotateLocker.Unlock()
-			}
-		} else if w.leaderLocker != nil {
-			w.leaderLocker.Unlock()
+		}
+		if w.rotateLocker != nil {
+			w.rotateLocker.Unlock()
 		}
 
 		w.mu.Lock()
@@ -304,48 +253,27 @@ func (w *Writer) tryBecomeLeader() bool {
 	return ok
 }
 
-// connectToLeader 客户端主循环：连接 Leader，监听命令，断线后自动重试或竞选 Leader。
-//
-// 当与 Leader 的连接断开时（例如 Leader 崩溃），客户端会尝试重新连接。
-// 如果连接失败，客户端会尝试成为新 Leader。
-// 注意：在尝试成为 Leader 之前，必须释放可能持有的旧锁，防止文件锁重入导致反复失败。
+// connectToLeader 客户端主循环：监听来自 notifier 的命令，并在 Leader 退出后竞选接管。
 func (w *Writer) connectToLeader() {
 	defer w.wg.Done()
 
-	for {
-		select {
-		case <-w.done:
-			return
-		default:
-		}
+	cmdCh, err := w.notifier.Connect()
+	if err != nil {
+		w.reportError(fmt.Errorf("客户端连接失败: %w", err))
+		return
+	}
+	w.handleCommands(cmdCh)
 
-		cmdCh, err := w.notifier.Connect()
-		if err != nil {
-			w.reportError(fmt.Errorf("客户端连接Leader失败: %w", err))
+	// 通道关闭（notifier 正在关闭）→ 尝试竞选新 Leader
+	select {
+	case <-w.done:
+		return
+	case <-time.After(500 * time.Millisecond):
+	}
 
-			select {
-			case <-w.done:
-				return
-			case <-time.After(1 * time.Second):
-			}
-
-			// 尝试成为 Leader（可能原 Leader 已退出）
-			// 先释放可能持有的锁，避免因为本进程曾是 Leader 导致 tryBecomeLeader 立即成功但 Serve 仍失败的死循环
-			w.leaderLocker.Unlock()
-			if w.tryBecomeLeader() {
-				w.wg.Add(1)
-				go w.runLeader()
-				return
-			}
-			continue
-		}
-		w.handleCommands(cmdCh)
-
-		select {
-		case <-w.done:
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
+	if w.tryBecomeLeader() {
+		w.wg.Add(1)
+		go w.runLeader()
 	}
 }
 
@@ -361,13 +289,10 @@ func (w *Writer) handleCommands(ch <-chan string) {
 }
 
 // doRotation 执行文件轮转：重命名、重开。
-// 标准模式持有 mu 锁；Lite 模式调用方已持有 rotateLocker 分布式锁。
 // 即使 doFileRotation 部分失败也会尝试 reopenFile——openFileAppend 的 O_CREATE 会自动创建文件。
 func (w *Writer) doRotation() error {
-	if !w.lite {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
 		if reopenErr := w.reopenFile(); reopenErr != nil {
 			return reopenErr

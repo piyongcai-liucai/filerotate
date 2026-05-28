@@ -12,7 +12,7 @@ import (
 )
 
 // Locker 分布式锁接口，用于保护轮转操作。
-// 在单机部署时，默认的文件锁（NewFileLocker）已足够。
+// 在单机部署时，默认的本地文件锁（NewLocalLocker）已足够。
 // 仅在跨主机共享文件系统（如 NFS）且需要协调轮转时，才需要实现此接口。
 type Locker interface {
 	// TryLock 非阻塞尝试获取锁，返回是否成功。
@@ -23,11 +23,11 @@ type Locker interface {
 	Unlock() error
 }
 
-// NewFileLocker 创建一个基于文件的本地互斥锁。
+// NewLocalLocker 创建一个基于文件的本地互斥锁。
 // lockPath 为锁文件路径，所有参与竞争的进程必须使用相同的路径。
 // 如果锁文件所在目录不存在，会自动创建。
-func NewFileLocker(lockPath string) (Locker, error) {
-	return locker.NewFileLocker(lockPath)
+func NewLocalLocker(lockPath string) (Locker, error) {
+	return locker.NewLocalLocker(lockPath)
 }
 
 // NewValkeyLocker 创建一个基于 Valkey 的分布式锁。

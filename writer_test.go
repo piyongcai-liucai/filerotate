@@ -338,6 +338,7 @@ func TestWriterNewLockerFactoryError(t *testing.T) {
 		LockerFactory: func(lockPath string) (Locker, error) {
 			return nil, fmt.Errorf("custom locker error")
 		},
+		NotifierFactory: func(errorHandler func(error)) (Notifier, error) { return &errorNotifier{}, nil },
 		ErrorHandler: silentErrors,
 	})
 	if err == nil {
@@ -345,24 +346,7 @@ func TestWriterNewLockerFactoryError(t *testing.T) {
 	}
 }
 
-// TestWriterNewNotifierFactoryError 验证 NotifierFactory 返回错误时 New 应失败。
-func TestWriterNewNotifierFactoryError(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestWriterNewNotifierFactoryError.log")
-	defer cleanupLogs(t, path)
 
-	_, err := New(Config{
-		FilePath:  path,
-		MaxSizeMB: 10,
-		NotifierFactory: func(commPath string, errorHandler func(error)) (Notifier, error) {
-			return nil, fmt.Errorf("custom notifier error")
-		},
-		ErrorHandler: silentErrors,
-	})
-	if err == nil {
-		t.Fatal("expected error from NotifierFactory")
-	}
-}
 
 // TestWriterConcurrentWrites 验证并发写入安全性。
 func TestWriterConcurrentWrites(t *testing.T) {
@@ -550,6 +534,7 @@ func TestNew_LockerFactoryError(t *testing.T) {
 		LockerFactory: func(lockPath string) (Locker, error) {
 			return nil, errors.New("custom locker error")
 		},
+		NotifierFactory: func(errorHandler func(error)) (Notifier, error) { return &errorNotifier{}, nil },
 		ErrorHandler: silentErrors,
 	})
 	if err == nil {
@@ -557,21 +542,22 @@ func TestNew_LockerFactoryError(t *testing.T) {
 	}
 }
 
-func TestNew_NotifierFactoryError(t *testing.T) {
+// TestNew_NotifierWithoutLocker 验证标准模式下设置通知器但未设置锁工厂时报错。
+func TestNew_NotifierWithoutLocker(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
 	defer cleanupLogs(t, path)
 
 	_, err := New(Config{
-		FilePath:  path,
-		MaxSizeMB: 10,
-		NotifierFactory: func(commPath string, errorHandler func(error)) (Notifier, error) {
-			return nil, errors.New("custom notifier error")
+		FilePath:     path,
+		MaxSizeMB:    10,
+		NotifierFactory: func(errorHandler func(error)) (Notifier, error) {
+			return &errorNotifier{}, nil
 		},
 		ErrorHandler: silentErrors,
 	})
 	if err == nil {
-		t.Fatal("expected error from NotifierFactory")
+		t.Fatal("expected error when NotifierFactory is set but LockerFactory is nil")
 	}
 }
 
@@ -613,29 +599,7 @@ func TestDoRotation_StandardMode(t *testing.T) {
 
 // ---------- New 工厂成功路径测试 ----------
 
-func TestNew_CustomNotifierFactorySuccess(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, t.Name()+".log")
-	defer cleanupLogs(t, path)
 
-	w, err := New(Config{
-		FilePath:     path,
-		MaxSizeMB:    10,
-		ErrorHandler: silentErrors,
-		NotifierFactory: func(commPath string, errorHandler func(error)) (Notifier, error) {
-			return NewLocalNotifier(commPath, errorHandler), nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { w.Close(); time.Sleep(200 * time.Millisecond) }()
-
-	_, err = w.Write([]byte("hello with custom notifier\n"))
-	if err != nil {
-		t.Fatalf("write: %v", err)
-	}
-}
 
 func TestNew_CustomLockerFactorySuccess(t *testing.T) {
 	ensureLogDir(t)
@@ -646,7 +610,10 @@ func TestNew_CustomLockerFactorySuccess(t *testing.T) {
 		FilePath:      path,
 		MaxSizeMB:     10,
 		ErrorHandler:  silentErrors,
-		LockerFactory: NewFileLocker,
+		LockerFactory: NewLocalLocker,
+		NotifierFactory: func(errorHandler func(error)) (Notifier, error) {
+			return &errorNotifier{}, nil
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

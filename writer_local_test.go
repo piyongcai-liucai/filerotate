@@ -1,5 +1,5 @@
-// writer_lite_test.go
-// Lite 模式 Writer 的单元测试。
+// writer_local_test.go
+// 单机模式 Writer 的单元测试。
 // 所有日志文件均写入 ./example/log 目录，避免系统临时目录的权限问题。
 package filerotate
 
@@ -11,13 +11,13 @@ import (
 	"time"
 )
 
-// TestLiteWriterBasic 验证基本写入功能。
-func TestLiteWriterBasic(t *testing.T) {
+// TestLocalWriterBasic 验证基本写入功能。
+func TestLocalWriterBasic(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterBasic.log")
+	path := filepath.Join(logDir, "TestLocalWriterBasic.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,13 +37,13 @@ func TestLiteWriterBasic(t *testing.T) {
 	}
 }
 
-// TestLiteWriterRotation 验证写入超过阈值后经 notifier 轮询触发轮转。
-func TestLiteWriterRotation(t *testing.T) {
+// TestLocalWriterRotation 验证写入超过阈值后经 notifier 轮询触发轮转。
+func TestLocalWriterRotation(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterRotation.log")
+	path := filepath.Join(logDir, "TestLocalWriterRotation.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, PollInterval: 50 * time.Millisecond})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, CheckInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,10 +80,10 @@ func TestLiteWriterRotation(t *testing.T) {
 	}
 }
 
-// TestLiteWriterCleanup 验证过期备份的自动删除。
-func TestLiteWriterCleanup(t *testing.T) {
+// TestLocalWriterCleanup 验证过期备份的自动删除。
+func TestLocalWriterCleanup(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterCleanup.log")
+	path := filepath.Join(logDir, "TestLocalWriterCleanup.log")
 	defer cleanupLogs(t, path)
 
 	oldTime := time.Now().AddDate(0, 0, -10)
@@ -106,7 +106,7 @@ func TestLiteWriterCleanup(t *testing.T) {
 	}
 	f.Close()
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 7, PollInterval: 50 * time.Millisecond})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 7, CheckInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,13 +137,13 @@ func TestLiteWriterCleanup(t *testing.T) {
 	}
 }
 
-// TestLiteWriterConcurrent 验证多 goroutine 并发写入的安全性。
-func TestLiteWriterConcurrent(t *testing.T) {
+// TestLocalWriterConcurrent 验证多 goroutine 并发写入的安全性。
+func TestLocalWriterConcurrent(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterConcurrent.log")
+	path := filepath.Join(logDir, "TestLocalWriterConcurrent.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,13 +179,13 @@ func TestLiteWriterConcurrent(t *testing.T) {
 	}
 }
 
-// TestLiteWriterEmptyWrite 验证空写入。
-func TestLiteWriterEmptyWrite(t *testing.T) {
+// TestLocalWriterEmptyWrite 验证空写入。
+func TestLocalWriterEmptyWrite(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterEmptyWrite.log")
+	path := filepath.Join(logDir, "TestLocalWriterEmptyWrite.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,13 +200,13 @@ func TestLiteWriterEmptyWrite(t *testing.T) {
 	}
 }
 
-// TestLiteWriterMultipleRotations 验证多次轮转。
-func TestLiteWriterMultipleRotations(t *testing.T) {
+// TestLocalWriterMultipleRotations 验证多次轮转。
+func TestLocalWriterMultipleRotations(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterMultipleRotations.log")
+	path := filepath.Join(logDir, "TestLocalWriterMultipleRotations.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, PollInterval: 50 * time.Millisecond})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, CheckInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,13 +235,13 @@ func TestLiteWriterMultipleRotations(t *testing.T) {
 	}
 }
 
-// TestLiteWriterCloseAndWrite 验证关闭后写入应报错。
-func TestLiteWriterCloseAndWrite(t *testing.T) {
+// TestLocalWriterCloseAndWrite 验证关闭后写入应报错。
+func TestLocalWriterCloseAndWrite(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterCloseAndWrite.log")
+	path := filepath.Join(logDir, "TestLocalWriterCloseAndWrite.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,17 +253,17 @@ func TestLiteWriterCloseAndWrite(t *testing.T) {
 	}
 }
 
-// TestLiteWriterPollingDetection 验证 notifier 轮询检测到其他进程轮转后，本进程能重开文件。
-func TestLiteWriterPollingDetection(t *testing.T) {
+// TestLocalWriterPollingDetection 验证 notifier 轮询检测到其他进程轮转后，本进程能重开文件。
+func TestLocalWriterPollingDetection(t *testing.T) {
 	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestLiteWriterPollingDetection.log")
+	path := filepath.Join(logDir, "TestLocalWriterPollingDetection.log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{
+	w, err := New(Config{
 		FilePath:     path,
 		MaxSizeMB:    0,
 		MaxAgeDays:   0,
-		PollInterval: 50 * time.Millisecond,
+		CheckInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -293,15 +293,15 @@ func TestLiteWriterPollingDetection(t *testing.T) {
 	}
 }
 
-// ---------- Lite 模式 rotateIfNeededLite 路径测试 ----------
+// ---------- 单机模式文件重建 / 外部轮转检测测试 ----------
 
-// TestLiteWriterRotateIfNeeded_FileRemoved 验证文件被外部删除后 rotateIfNeededLite 能重建。
-func TestLiteWriterRotateIfNeeded_FileRemoved(t *testing.T) {
+// TestLocalWriter_FileRemovedRecreates 验证文件被外部删除后 Write() 能通过 reopenFile 重建。
+func TestLocalWriter_FileRemovedRecreates(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,7 @@ func TestLiteWriterRotateIfNeeded_FileRemoved(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	os.Remove(path)
 
-	// 手动触发轮转信号 — 文件不存在时 rotateIfNeededLite 应重建
+	// 手动触发轮转信号 — Write() 收到信号后调用 reopenFile（O_CREATE 重建文件）
 	w.rotateCh <- struct{}{}
 	time.Sleep(100 * time.Millisecond)
 
@@ -328,13 +328,13 @@ func TestLiteWriterRotateIfNeeded_FileRemoved(t *testing.T) {
 	}
 }
 
-// TestLiteWriterRotateIfNeeded_AlreadyRotated 验证外部轮转后 SameFile 检测生效。
-func TestLiteWriterRotateIfNeeded_AlreadyRotated(t *testing.T) {
+// TestLocalWriter_ExternalRotationReopen 验证外部轮转后 Write() 能重开新文件。
+func TestLocalWriter_ExternalRotationReopen(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
 	defer cleanupLogs(t, path)
 
-	w, err := NewLite(LiteConfig{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,48 +350,89 @@ func TestLiteWriterRotateIfNeeded_AlreadyRotated(t *testing.T) {
 	f, _ := os.Create(path)
 	f.Close()
 
-	// 手动触发轮转信号
+	// 手动触发轮转信号 — Write() 收到后调用 reopenFile 重开新文件
 	w.rotateCh <- struct{}{}
 	time.Sleep(100 * time.Millisecond)
 
-	// Write 应正常工作（已检测到 inode 变化并重开文件）
+	// Write 应正常工作（已重开新文件）
 	_, err = w.Write([]byte("after external rotation\n"))
 	if err != nil {
 		t.Fatalf("write after external rotation: %v", err)
 	}
 }
 
-// TestLiteWriterRotateIfNeeded_LockError 验证 TryLock 错误时的错误处理。
-func TestLiteWriterRotateIfNeeded_LockError(t *testing.T) {
+// TestLocalWriter_TryLockError 验证 runLocalLoop 中 rotateLocker.TryLock 错误时的处理。
+func TestLocalWriter_TryLockError(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
 	defer cleanupLogs(t, path)
+
+	// 写入足够大的数据触发 size 检查
+	if err := os.WriteFile(path, []byte(strings.Repeat("a", 200)), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	f, err := openFileAppend(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
 
 	var capturedErr error
+	var capturedMsg string
 	w := &Writer{
-		lite:         true,
-		file:         f,
-		filePath:     path,
-		rotateLocker: &errorLocker{},
-		rotateCh:     make(chan struct{}, 1),
-		errorHandler: func(err error) { capturedErr = err },
+		local:         true,
+		file:          f,
+		filePath:      path,
+		maxSize:       10,
+		checkInterval: 50 * time.Millisecond,
+		rotateLocker:  &errorLocker{},
+		rotateCh:      make(chan struct{}, 1),
+		done:          make(chan struct{}),
+		errorHandler:  func(err error) { capturedErr = err; capturedMsg = err.Error() },
 	}
 
-	w.rotateCh <- struct{}{}
-	w.rotateIfNeededLite()
+	cmdCh := make(chan string, 1)
+	cmdCh <- CmdRotate
+	close(cmdCh)
+
+	w.wg.Add(1)
+	w.runLocalLoop(cmdCh)
 
 	if capturedErr == nil {
-		t.Fatal("expected error to be reported")
+		t.Fatal("expected error to be reported from TryLock")
 	}
-	select {
-	case <-w.rotateCh:
-	default:
-		t.Fatal("expected rotate signal to be requeued")
+	if !strings.Contains(capturedMsg, "mock error") {
+		t.Fatalf("expected mock lock error, got: %v", capturedErr)
+	}
+}
+
+// TestLocalWriter_TwoWritersCoexist 验证两个单机 Writer 共存且各自独立工作。
+func TestLocalWriter_TwoWritersCoexist(t *testing.T) {
+	ensureLogDir(t)
+	path := filepath.Join(logDir, t.Name()+".log")
+	defer cleanupLogs(t, path)
+
+	w1, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w1.Close()
+
+	w2, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	// 两者都能正常写入
+	_, err = w1.Write([]byte("from w1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = w2.Write([]byte("from w2\n"))
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

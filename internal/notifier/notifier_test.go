@@ -68,6 +68,17 @@ func connectValkeyOrSkip(t *testing.T) valkey.Client {
 	return client
 }
 
+// drainChannel 清空通道中所有待处理的消息。
+func drainChannel(ch <-chan string) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
 // assertChannelReceived 断言在超时时间内从通道中收到指定的命令。
 // 如果超时未收到或收到的命令不匹配，则标记测试失败。
 func assertChannelReceived(t *testing.T, ch <-chan string, expected string, timeout time.Duration) {
