@@ -152,7 +152,7 @@ func childBasic(filePath string) error {
 func childRotate(filePath string) error {
 	w, err := New(Config{
 		FilePath:      filePath,
-		MaxSizeMB:     0,
+		MaxSizeMB:     1,
 		MaxAgeDays:    0,
 		CheckInterval: 100 * time.Millisecond,
 	})
@@ -276,7 +276,7 @@ func TestMultiGoroutineRotation(t *testing.T) {
 		wg.Go(func() {
 			w, err := New(Config{
 				FilePath:      path,
-				MaxSizeMB:     0,
+				MaxSizeMB:     1,
 				MaxAgeDays:    0,
 				CheckInterval: 100 * time.Millisecond,
 			})

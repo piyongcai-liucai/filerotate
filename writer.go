@@ -32,7 +32,6 @@ type Config struct {
 type Writer struct {
 	file          *os.File // 当前文件句柄，O_APPEND 模式
 	filePath      string
-	lockPath      string
 	maxSize       int64
 	maxAgeDays    int
 	checkInterval time.Duration
@@ -41,7 +40,7 @@ type Writer struct {
 
 	rotateLocker *flock.Flock // 文件锁，多进程协调
 
-	pollMu       sync.Mutex  // 保护轮询状态
+	pollMu       sync.Mutex  // 保护 pollActive
 	lastFileInfo os.FileInfo // 上次 stat 结果，用于检测 inode 变化
 	pollActive   bool        // 等待 Write() 处理当前轮转中
 
@@ -65,7 +64,7 @@ func New(cfg Config) (*Writer, error) {
 
 	w := &Writer{
 		filePath:      cfg.FilePath,
-		lockPath:      cfg.FilePath + ".lock",
+		rotateLocker:  flock.New(cfg.FilePath + ".lock"),
 		maxSize:       int64(cfg.MaxSizeMB) * 1024 * 1024,
 		maxAgeDays:    cfg.MaxAgeDays,
 		checkInterval: cfg.CheckInterval,
@@ -79,12 +78,9 @@ func New(cfg Config) (*Writer, error) {
 	}
 
 	var err error
-	w.file, err = openFileAppend(w.filePath)
-	if err != nil {
+	if w.file, err = openFileAppend(w.filePath); err != nil {
 		return nil, err
 	}
-
-	w.rotateLocker = flock.New(w.lockPath)
 
 	fi, err := w.file.Stat()
 	if err != nil {
@@ -109,12 +105,10 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 			w.reportError(err)
 			w.rotateCh <- struct{}{}
 		} else {
-			w.pollMu.Lock()
-			w.pollActive = false
+			w.setPollActive(false)
 			if fi, err := w.file.Stat(); err == nil {
 				w.lastFileInfo = fi
 			}
-			w.pollMu.Unlock()
 		}
 	default:
 	}
@@ -161,11 +155,8 @@ func (w *Writer) poll() {
 // 先尝试获取文件锁（非阻塞），拿到锁后在锁保护下检查文件大小。
 // flock 仅对本机进程有效，NFS 跨主机时可能出现多个主机同时判断超阈值并执行
 // rename——先到者 rename 成功后后来者可能 rename 前者刚创建的空文件，产生空备份，
-// 但不会丢失数据。轮转不频繁，pollMu 和 rotateLocker 均使用 defer 释放。
+// 但不会丢失数据。rotateLocker 使用 defer 释放，pollMu 仅锁 pollActive 字段。
 func (w *Writer) checkAndRotate() {
-	w.pollMu.Lock()
-	defer w.pollMu.Unlock()
-
 	if w.pollActive {
 		return
 	}
@@ -185,13 +176,14 @@ func (w *Writer) checkAndRotate() {
 		if os.IsNotExist(err) {
 			// 文件不存在（其他进程 rename 后尚未重建，或被人手动删除）
 			// 通知 Write() 重开文件：不存在则创建，已存在则打开，两者皆安全。
-			w.pollActive = true
+			w.setPollActive(true)
 			w.rotateCh <- struct{}{}
 			return
 		}
 		w.reportError(err)
 		return
 	}
+
 	fi, err := f.Stat()
 	f.Close()
 	if err != nil {
@@ -210,7 +202,7 @@ func (w *Writer) checkAndRotate() {
 
 	// 文件有变化（inode 变了或刚完成轮转），通知 Write() 重开文件句柄。
 	if !os.SameFile(w.lastFileInfo, fi) || needRotation {
-		w.pollActive = true
+		w.setPollActive(true)
 		w.rotateCh <- struct{}{}
 	}
 }
@@ -232,4 +224,10 @@ func (w *Writer) reportError(err error) {
 	if w.errorHandler != nil {
 		w.errorHandler(err)
 	}
+}
+
+func (w *Writer) setPollActive(v bool) {
+	w.pollMu.Lock()
+	w.pollActive = v
+	w.pollMu.Unlock()
 }

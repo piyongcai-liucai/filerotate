@@ -188,7 +188,14 @@ func TestWriterCleanup(t *testing.T) {
 		if !isBackupFile(filepath.Base(path), filepath.Base(b)) {
 			continue // 跳过锁文件
 		}
-		fi, _ := os.Stat(b)
+		fi, err := os.Stat(b)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // 文件在 Glob 之后被 cleanOldBackups 删除
+			}
+			t.Errorf("stat backup %s: %v", b, err)
+			continue
+		}
 		if fi.ModTime().Before(time.Now().AddDate(0, 0, -7)) {
 			t.Errorf("old backup %s should have been deleted", b)
 		}
