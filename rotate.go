@@ -11,39 +11,55 @@ import (
 	"time"
 )
 
-// doFileRotation 执行文件重命名、创建新文件、清理旧备份。
-// 调用者应确保已持有锁，避免并发轮转。
+// doFileRotation 执行文件重命名和过期备份清理。
 //
-// openFileAppend 使用 O_CREATE，会在下次写入时自动创建文件，因此此处无需单独 os.Create。
+// rename 前二次确认文件大小，避免 NFS 跨主机场景下对已被其他主机轮转后的
+// 新文件（空文件）再次 rename，产生空备份。
 //
 // 参数:
 //   - filePath: 要轮转的文件路径
+//   - maxSize: 轮转阈值（字节），用于二次确认
 //   - maxAgeDays: 备份文件保留天数，0 表示不清理
 //
-// 返回 nil 表示成功。
-func doFileRotation(filePath string, maxAgeDays int) error {
-	// 使用纳秒级精度的时间戳，避免同一秒内多次轮转导致备份文件名冲突
-	now := time.Now()
-	backupName := filePath + "." + now.Format("20060102_150405.000000000")
-
-	// Windows 下文件关闭后句柄可能延迟释放，重试 3 次以应对
-	var err error
-	for i := 0; i < 3; i++ {
-		err = os.Rename(filePath, backupName)
-		if err == nil {
+// 返回 nil 表示成功或无需轮转（文件已被其他主机处理）。
+func doFileRotation(filePath string, maxSize int64, maxAgeDays int) error {
+	for i := range 3 {
+		if err := tryRotate(filePath, maxSize); err == nil {
 			break
+		} else if i == 2 {
+			return fmt.Errorf("rotation: %w", err)
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err != nil {
-		return fmt.Errorf("rename: %w", err)
-	}
 
-	// 如果配置了保留天数，清理过期备份
 	if maxAgeDays > 0 {
 		cleanOldBackups(filePath, maxAgeDays)
 	}
 	return nil
+}
+
+// tryRotate 尝试执行一次文件轮转。
+// 返回 nil 表示成功或无需轮转（文件已被其他主机处理）。
+func tryRotate(filePath string, maxSize int64) error {
+	f, err := os.Open(filePath)
+	if os.IsNotExist(err) {
+		return nil // 已被其他主机 rename
+	} else if err != nil {
+		return err
+	}
+
+	fi, err := f.Stat()
+	f.Close()
+
+	if err != nil {
+		return err
+	} else if maxSize > 0 && fi.Size() < maxSize {
+		return nil // 已是其他主机创建的新文件
+	}
+
+	backupName := filePath + "." + time.Now().Format("20060102_150405.000000000")
+	return os.Rename(filePath, backupName)
 }
 
 // cleanOldBackups 删除超过 maxAgeDays 天的备份文件。

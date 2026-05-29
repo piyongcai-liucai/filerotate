@@ -58,10 +58,10 @@ func TestWriterBasic(t *testing.T) {
 	defer cleanupLogs(t, path)
 
 	w, err := New(Config{
-		FilePath:      path,
-		MaxSizeMB:     10,
-		MaxAgeDays:    0,
-		ErrorHandler:  silentErrors,
+		FilePath:     path,
+		MaxSizeMB:    10,
+		MaxAgeDays:   0,
+		ErrorHandler: silentErrors,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestWriterCleanup(t *testing.T) {
 
 	// 创建3个旧备份文件，修改时间为10天前
 	oldTime := time.Now().AddDate(0, 0, -10)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ts := oldTime.Add(time.Duration(i) * time.Hour).Format("20060102_150405")
 		f, err := os.Create(path + "." + ts)
 		if err != nil {
@@ -234,7 +234,6 @@ func TestWriterWriteAfterRotation(t *testing.T) {
 	}
 }
 
-
 // TestWriterCloseWrite 验证关闭后写入应报错。
 func TestWriterCloseWrite(t *testing.T) {
 	ensureLogDir(t)
@@ -282,9 +281,9 @@ func TestWriterConcurrentWrites(t *testing.T) {
 	msg := "concurrent test message\n"
 
 	errCh := make(chan error, goroutines)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
-			for j := 0; j < writesPer; j++ {
+			for range writesPer {
 				if _, err := w.Write([]byte(msg)); err != nil {
 					errCh <- err
 					return
@@ -294,7 +293,7 @@ func TestWriterConcurrentWrites(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		if err := <-errCh; err != nil {
 			t.Fatal(err)
 		}
@@ -307,9 +306,7 @@ func TestWriterConcurrentWrites(t *testing.T) {
 	}
 }
 
-
-
-func TestReququeueRotate(t *testing.T) {
+func TestRotateChSignal(t *testing.T) {
 	w := &Writer{rotateCh: make(chan struct{}, 1)}
 	w.rotateCh <- struct{}{}
 	select {
@@ -337,14 +334,12 @@ func TestReopenFile_Error(t *testing.T) {
 	}
 }
 
-
 func TestOpenFileAppend_NonexistentDir(t *testing.T) {
 	_, err := openFileAppend(filepath.Join(logDir, "nonexistent_"+t.Name(), "test.log"))
 	if err == nil {
 		t.Fatal("expected error for nonexistent directory")
 	}
 }
-
 
 func TestNew_MkdirAllError(t *testing.T) {
 	ensureLogDir(t)
@@ -384,7 +379,7 @@ func TestDoRotation_FileRenamed(t *testing.T) {
 		errorHandler: silentErrors,
 	}
 
-	if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
+	if err := doFileRotation(w.filePath, w.maxSize, w.maxAgeDays); err != nil {
 		t.Fatalf("doRotation failed: %v", err)
 	}
 
@@ -397,6 +392,7 @@ func TestDoRotation_FileRenamed(t *testing.T) {
 		t.Fatal("backup file should exist after rotation")
 	}
 }
+
 func TestOpenFileAppend_ReadOnlyFile(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
@@ -436,9 +432,9 @@ func TestWriterConcurrent(t *testing.T) {
 	msg := "test\n"
 
 	errCh := make(chan error, goroutines)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
-			for j := 0; j < writes; j++ {
+			for range writes {
 				if _, err := w.Write([]byte(msg)); err != nil {
 					errCh <- err
 					return
@@ -448,7 +444,7 @@ func TestWriterConcurrent(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		if err := <-errCh; err != nil {
 			t.Fatal(err)
 		}
@@ -495,7 +491,7 @@ func TestWriterMultipleRotations(t *testing.T) {
 	defer w.Close()
 	w.maxSize = 10 // 测试用极小值，int64 在现代平台上原子读写
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		_, err := w.Write([]byte(strings.Repeat("a", 100)))
 		if err != nil {
 			t.Fatalf("write %d: %v", i, err)
@@ -513,24 +509,6 @@ func TestWriterMultipleRotations(t *testing.T) {
 	}
 	if count < 2 {
 		t.Fatalf("expected at least 2 backup files, got %d", count)
-	}
-}
-
-// TestWriterCloseAndWrite 验证关闭后写入应报错。
-func TestWriterCloseAndWrite(t *testing.T) {
-	ensureLogDir(t)
-	path := filepath.Join(logDir, "TestWriterCloseAndWrite.log")
-	defer cleanupLogs(t, path)
-
-	w, err := New(Config{FilePath: path, MaxSizeMB: 10, MaxAgeDays: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.Close()
-
-	_, err = w.Write([]byte("hello\n"))
-	if err == nil {
-		t.Fatal("expected error after close")
 	}
 }
 

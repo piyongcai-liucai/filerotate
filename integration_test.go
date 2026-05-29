@@ -87,15 +87,13 @@ func runTwoChildren(t *testing.T, role, path string, timeout time.Duration) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 2 {
+		wg.Go(func() {
 			_, err := runChild(role, path, timeout)
 			if err != nil {
 				errCh <- err
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errCh)
@@ -142,7 +140,7 @@ func childBasic(filePath string) error {
 	defer w.Close()
 
 	marker := fmt.Sprintf("[PID %d]\n", os.Getpid())
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if _, err := w.Write([]byte(marker)); err != nil {
 			return err
 		}
@@ -166,7 +164,7 @@ func childRotate(filePath string) error {
 	w.maxSize = 2048 // 测试用极小值，int64 在现代平台上原子读写
 
 	chunk := strings.Repeat("z", 256)
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		line := fmt.Sprintf("[%d] chunk %d: %s\n", os.Getpid(), i, chunk)
 		if _, err := w.Write([]byte(line)); err != nil {
 			return err
@@ -256,9 +254,7 @@ func TestMultiGoroutineRotation(t *testing.T) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		base := filepath.Base(path)
 		for {
 			matches, _ := filepath.Glob(path + ".2*")
@@ -274,12 +270,10 @@ func TestMultiGoroutineRotation(t *testing.T) {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-	}()
+	})
 
-	for id := 0; id < numProcs; id++ {
-		wg.Add(1)
-		go func(procID int) {
-			defer wg.Done()
+	for id := range numProcs {
+		wg.Go(func() {
 			w, err := New(Config{
 				FilePath:      path,
 				MaxSizeMB:     0,
@@ -300,10 +294,10 @@ func TestMultiGoroutineRotation(t *testing.T) {
 					return
 				default:
 				}
-				fmt.Fprintf(w, "[%d/%d] line %d: %s\n", procID, numProcs, i, chunk)
+				fmt.Fprintf(w, "[%d/%d] line %d: %s\n", id, numProcs, i, chunk)
 				time.Sleep(time.Millisecond)
 			}
-		}(id)
+		})
 	}
 
 	wg.Wait()

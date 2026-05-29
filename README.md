@@ -88,8 +88,8 @@ filerotate/
 poll → checkAndRotate()
   ├── TryLock()（非阻塞抢锁，没抢到说明别人在轮转，跳过）
   ├── 抢到锁 → os.Open + f.Stat（绕过 NFS 属性缓存）
-  ├── 大小超阈值 → doRotation()（rename + reopenFile）
-  ├── inode 变化（别人轮转了）→ 仅发信号通知 Write() 重开文件
+  ├── 大小超阈值 → doFileRotation()（rename + 清理过期备份，3次重试）
+  ├── inode 变化（别人轮转了）→ 发信号通知 Write() 重开文件
   └── 发信号到 rotateCh → Write() 收到后 reopenFile()
 ```
 
@@ -99,10 +99,4 @@ poll → checkAndRotate()
 
 ```
 app.log.20240501_143025.123456789
-```
-
-旧格式（秒级精度）的备份文件同样支持识别和清理：
-
-```
-app.log.20240501_143025
 ```

@@ -119,11 +119,10 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 	default:
 	}
 
-	f := w.file
-	if f == nil {
+	if w.file == nil {
 		return 0, ErrFileNotOpen
 	}
-	return f.Write(p)
+	return w.file.Write(p)
 }
 
 // Close 释放资源，关闭文件和锁。
@@ -184,8 +183,8 @@ func (w *Writer) checkAndRotate() {
 	f, err := os.Open(w.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 文件被其他主机 rename 了（NFS 跨主机 flock 无效），
-			// 这不是错误，通知 Write() 重开文件即可。
+			// 文件不存在（其他进程 rename 后尚未重建，或被人手动删除）
+			// 通知 Write() 重开文件：不存在则创建，已存在则打开，两者皆安全。
 			w.pollActive = true
 			w.rotateCh <- struct{}{}
 			return
@@ -200,18 +199,19 @@ func (w *Writer) checkAndRotate() {
 		return
 	}
 
-	if !os.SameFile(w.lastFileInfo, fi) || (w.maxSize > 0 && fi.Size() >= w.maxSize) {
-		w.pollActive = true
-		w.lastFileInfo = fi
-
-		if w.maxSize > 0 && fi.Size() >= w.maxSize {
-			if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
-				w.reportError(fmt.Errorf("轮转执行失败: %w", err))
-			}
+	// 超阈值则执行轮转。无论是本进程写超的还是其他进程写超的，谁拿到锁谁负责轮转。
+	needRotation := w.maxSize > 0 && fi.Size() >= w.maxSize
+	if needRotation {
+		if err := doFileRotation(w.filePath, w.maxSize, w.maxAgeDays); err != nil {
+			w.reportError(fmt.Errorf("轮转执行失败: %w", err))
+			return
 		}
+	}
+
+	// 文件有变化（inode 变了或刚完成轮转），通知 Write() 重开文件句柄。
+	if !os.SameFile(w.lastFileInfo, fi) || needRotation {
+		w.pollActive = true
 		w.rotateCh <- struct{}{}
-	} else {
-		w.lastFileInfo = fi
 	}
 }
 
