@@ -30,8 +30,7 @@ type Config struct {
 // 超阈值时通过文件锁竞争轮转权。Write() 热路径不加锁，
 // 依赖 O_APPEND 内核级原子追加。支持本地文件系统和 NFS。
 type Writer struct {
-	mu            sync.Mutex // 保护 doRotation 文件替换和 Close
-	file          *os.File   // 当前文件句柄，O_APPEND 模式
+	file          *os.File // 当前文件句柄，O_APPEND 模式
 	filePath      string
 	lockPath      string
 	maxSize       int64
@@ -94,8 +93,10 @@ func New(cfg Config) (*Writer, error) {
 	}
 	w.lastFileInfo = fi
 
-	w.wg.Add(1)
-	go w.poll()
+	if w.maxSize > 0 {
+		w.wg.Add(1)
+		go w.poll()
+	}
 	return w, nil
 }
 
@@ -106,7 +107,7 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 	case <-w.rotateCh:
 		if err := w.reopenFile(); err != nil {
 			w.reportError(err)
-			w.requeueRotate()
+			w.rotateCh <- struct{}{}
 		} else {
 			w.pollMu.Lock()
 			w.pollActive = false
@@ -134,8 +135,6 @@ func (w *Writer) Close() error {
 		w.rotateLocker.Unlock()
 	}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.file != nil {
 		return w.file.Close()
 	}
@@ -184,6 +183,13 @@ func (w *Writer) checkAndRotate() {
 
 	f, err := os.Open(w.filePath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// 文件被其他主机 rename 了（NFS 跨主机 flock 无效），
+			// 这不是错误，通知 Write() 重开文件即可。
+			w.pollActive = true
+			w.rotateCh <- struct{}{}
+			return
+		}
 		w.reportError(err)
 		return
 	}
@@ -199,30 +205,14 @@ func (w *Writer) checkAndRotate() {
 		w.lastFileInfo = fi
 
 		if w.maxSize > 0 && fi.Size() >= w.maxSize {
-			if err := w.doRotation(); err != nil {
+			if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
 				w.reportError(fmt.Errorf("轮转执行失败: %w", err))
 			}
 		}
-		select {
-		case w.rotateCh <- struct{}{}:
-		default:
-		}
+		w.rotateCh <- struct{}{}
 	} else {
 		w.lastFileInfo = fi
 	}
-}
-
-// doRotation 执行文件轮转：重命名、重开。
-func (w *Writer) doRotation() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
-		if reopenErr := w.reopenFile(); reopenErr != nil {
-			return reopenErr
-		}
-		return err
-	}
-	return w.reopenFile()
 }
 
 func (w *Writer) reopenFile() error {
@@ -241,12 +231,5 @@ func (w *Writer) reopenFile() error {
 func (w *Writer) reportError(err error) {
 	if w.errorHandler != nil {
 		w.errorHandler(err)
-	}
-}
-
-func (w *Writer) requeueRotate() {
-	select {
-	case w.rotateCh <- struct{}{}:
-	default:
 	}
 }

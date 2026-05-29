@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -94,7 +93,7 @@ func TestWriterRotation(t *testing.T) {
 
 	w, err := New(Config{
 		FilePath:      path,
-		MaxSizeMB:     0,
+		MaxSizeMB:     1,
 		CheckInterval: 50 * time.Millisecond,
 		ErrorHandler:  silentErrors,
 	})
@@ -161,7 +160,7 @@ func TestWriterCleanup(t *testing.T) {
 
 	w, err := New(Config{
 		FilePath:      path,
-		MaxSizeMB:     0,
+		MaxSizeMB:     1,
 		MaxAgeDays:    7,
 		CheckInterval: 50 * time.Millisecond,
 		ErrorHandler:  silentErrors,
@@ -204,7 +203,7 @@ func TestWriterWriteAfterRotation(t *testing.T) {
 
 	w, err := New(Config{
 		FilePath:      path,
-		MaxSizeMB:     0,
+		MaxSizeMB:     1,
 		CheckInterval: 50 * time.Millisecond,
 		ErrorHandler:  silentErrors,
 	})
@@ -312,34 +311,13 @@ func TestWriterConcurrentWrites(t *testing.T) {
 
 func TestReququeueRotate(t *testing.T) {
 	w := &Writer{rotateCh: make(chan struct{}, 1)}
-	w.requeueRotate()
+	w.rotateCh <- struct{}{}
 	select {
 	case <-w.rotateCh:
 	default:
 		t.Fatal("expected signal in rotateCh")
 	}
 }
-
-func TestReququeueRotate_NoDoubleQueue(t *testing.T) {
-	w := &Writer{rotateCh: make(chan struct{}, 1)}
-	w.rotateCh <- struct{}{} // 填满通道
-	w.requeueRotate()        // 不应阻塞（通道已满，丢弃）
-
-	select {
-	case <-w.rotateCh:
-	default:
-		t.Fatal("expected signal in rotateCh")
-	}
-	// 通道应为空（没有第二个信号）
-	select {
-	case <-w.rotateCh:
-		t.Fatal("expected no second signal")
-	default:
-	}
-}
-
-
-
 
 func TestReopenFile_Error(t *testing.T) {
 	ensureLogDir(t)
@@ -389,15 +367,11 @@ func TestNew_MkdirAllError(t *testing.T) {
 	}
 }
 
-
-
-
-func TestDoRotation_StandardMode(t *testing.T) {
+func TestDoRotation_FileRenamed(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
 	defer cleanupLogs(t, path)
 
-	// 创建文件并写入一些数据
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -407,26 +381,22 @@ func TestDoRotation_StandardMode(t *testing.T) {
 
 	w := &Writer{
 		filePath:     path,
-		mu:           sync.Mutex{},
 		errorHandler: silentErrors,
 	}
-	// 手动设置 file，doRotation 需要它
-	w.file, err = openFileAppend(path)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	if err := w.doRotation(); err != nil {
+	if err := doFileRotation(w.filePath, w.maxAgeDays); err != nil {
 		t.Fatalf("doRotation failed: %v", err)
 	}
 
-	// 新文件应已创建
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Fatal("new file should exist after rotation")
+	// 原文件应已被 rename，备份文件应存在
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("original file should not exist after rotation")
+	}
+	backups, _ := filepath.Glob(path + ".2*")
+	if len(backups) == 0 {
+		t.Fatal("backup file should exist after rotation")
 	}
 }
-
-
 func TestOpenFileAppend_ReadOnlyFile(t *testing.T) {
 	ensureLogDir(t)
 	path := filepath.Join(logDir, t.Name()+".log")
@@ -518,7 +488,7 @@ func TestWriterMultipleRotations(t *testing.T) {
 	path := filepath.Join(logDir, "TestWriterMultipleRotations.log")
 	defer cleanupLogs(t, path)
 
-	w, err := New(Config{FilePath: path, MaxSizeMB: 0, MaxAgeDays: 0, CheckInterval: 50 * time.Millisecond})
+	w, err := New(Config{FilePath: path, MaxSizeMB: 1, MaxAgeDays: 0, CheckInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +542,7 @@ func TestWriterPollingDetection(t *testing.T) {
 
 	w, err := New(Config{
 		FilePath:      path,
-		MaxSizeMB:     0,
+		MaxSizeMB:     1,
 		MaxAgeDays:    0,
 		CheckInterval: 50 * time.Millisecond,
 	})
